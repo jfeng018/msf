@@ -296,6 +296,12 @@ func (a *App) logPaths(service string) []string {
 		}
 		return paths
 	}
+	if service == "singbox" || service == "sing-box" {
+		return []string{
+			filepath.Join(a.DataDir, "logs/singbox.out.log"),
+			filepath.Join(a.DataDir, "logs/singbox.err.log"),
+		}
+	}
 	if spec, err := a.Services.spec(service); err == nil {
 		return []string{spec.Stdout, spec.Stderr}
 	}
@@ -409,7 +415,16 @@ func parseAnyLogTime(value string) (time.Time, bool) {
 	if value == "" {
 		return time.Time{}, false
 	}
-	layouts := []string{time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02"}
+	value = strings.ReplaceAll(value, "/", "-")
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
 	for _, layout := range layouts {
 		if t, err := time.Parse(layout, value); err == nil {
 			return t, true

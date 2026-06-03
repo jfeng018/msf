@@ -13,8 +13,7 @@ BIN := $(DIST)/$(APP_NAME)-$(GOOS)-$(GOARCH)
 PACKAGE_DIR := $(DIST)/$(APP_NAME)-$(VERSION)-$(GOOS)-$(GOARCH)
 
 frontend:
-	@test -f internal/server/web/dist/index.html || (echo "missing exported web assets; run: make import-web WEB_EXPORT=$(WEB_EXPORT)" && exit 1)
-	@echo "using exported MSM web assets from internal/server/web/dist"
+	cd web && npm ci && npm run build
 
 import-web:
 	@tmp=$$(mktemp -d); \
@@ -31,7 +30,7 @@ import-web:
 	rm -rf "$$tmp"; \
 	echo "imported exported MSM web assets from $(WEB_EXPORT)"
 
-build: frontend package
+build: package
 
 package: frontend
 	mkdir -p $(DIST)

@@ -5,14 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -132,6 +135,7 @@ func (a *App) networkInfoPayload(content string) map[string]any {
 	}
 	nftPath := filepath.Join(a.DataDir, "configs/network/network.nft")
 	interfaces := networkInterfaceSummaries()
+	domesticExit, internationalExit := a.networkExitInfo()
 	return map[string]any{
 		"config":             content,
 		"nft":                fileExists(nftPath),
@@ -143,9 +147,233 @@ func (a *App) networkInfoPayload(content string) map[string]any {
 		"localIPs":           localIPs(),
 		"local_ips":          localIPs(),
 		"interfaces":         interfaces,
-		"ipip":               nil,
-		"ipsb":               nil,
+		"ipip":               domesticExit,
+		"ipsb":               internationalExit,
+		"domestic":           domesticExit,
+		"international":      internationalExit,
+		"china_exit":         domesticExit,
+		"global_exit":        internationalExit,
 	}
+}
+
+const networkExitProbeTimeout = 3500 * time.Millisecond
+
+var ipipTextPattern = regexp.MustCompile(`(?i)(?:当前\s*)?IP[：:\s]+([0-9a-f:.]+)\s+来自于[：:\s]*(.+)`)
+
+func (a *App) networkExitInfo() (map[string]any, map[string]any) {
+	var wg sync.WaitGroup
+	var domestic map[string]any
+	var international map[string]any
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		domestic = probeDomesticExit()
+	}()
+	go func() {
+		defer wg.Done()
+		international = probeInternationalExit()
+	}()
+	wg.Wait()
+	return domestic, international
+}
+
+func probeDomesticExit() map[string]any {
+	client := networkExitHTTPClient(networkExitProbeTimeout)
+	var lastErr error
+	for _, endpoint := range []string{"https://myip.ipip.net", "http://myip.ipip.net"} {
+		body, err := fetchExitBody(client, endpoint)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		info, err := parseIPIPExitText(string(body))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		info["source"] = "myip.ipip.net"
+		info["via"] = "direct"
+		info["success"] = true
+		return info
+	}
+	return exitProbeError("myip.ipip.net", "direct", lastErr)
+}
+
+func probeInternationalExit() map[string]any {
+	client := networkExitHTTPClient(networkExitProbeTimeout)
+	info, err := fetchInternationalExit(client)
+	if err != nil {
+		return exitProbeError("api.ip.sb", "direct", err)
+	}
+	info["via"] = "direct"
+	info["success"] = true
+	return info
+}
+
+func fetchInternationalExit(client *http.Client) (map[string]any, error) {
+	var lastErr error
+	for _, endpoint := range []string{"https://api.ip.sb/geoip", "https://ipinfo.io/json", "https://ifconfig.co/json"} {
+		body, err := fetchExitBody(client, endpoint)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			lastErr = err
+			continue
+		}
+		info := normalizeInternationalExit(payload)
+		if info["ip"] == "" && info["location"] == "" {
+			lastErr = fmt.Errorf("%s returned incomplete exit data", endpoint)
+			continue
+		}
+		info["source"] = endpoint
+		return info, nil
+	}
+	return nil, lastErr
+}
+
+func networkExitHTTPClient(timeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	return &http.Client{Timeout: timeout, Transport: transport}
+}
+
+func fetchExitBody(client *http.Client, endpoint string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), networkExitProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json,text/plain,*/*")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; msm-free/exit-probe)")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s returned HTTP %d", endpoint, resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+}
+
+func parseIPIPExitText(text string) (map[string]any, error) {
+	text = strings.TrimSpace(text)
+	matches := ipipTextPattern.FindStringSubmatch(text)
+	if len(matches) < 3 {
+		return nil, fmt.Errorf("unexpected ipip response: %s", text)
+	}
+	ip := strings.TrimSpace(matches[1])
+	location := normalizeSpace(matches[2])
+	parts := strings.Fields(location)
+	info := map[string]any{
+		"ip":         ip,
+		"public_ip":  ip,
+		"address_ip": ip,
+		"location":   location,
+		"address":    location,
+	}
+	if len(parts) > 0 {
+		info["country"] = parts[0]
+	}
+	if len(parts) > 1 {
+		info["province"] = parts[1]
+	}
+	if len(parts) > 2 {
+		info["city"] = parts[2]
+	}
+	if len(parts) > 3 {
+		info["isp"] = strings.Join(parts[3:], " ")
+	}
+	return info, nil
+}
+
+func normalizeInternationalExit(data map[string]any) map[string]any {
+	ip := firstNonEmpty(
+		mapStringAny(data, "ip"),
+		mapStringAny(data, "query"),
+		mapStringAny(data, "address"),
+	)
+	country := firstNonEmpty(mapStringAny(data, "country"), mapStringAny(data, "country_name"), mapStringAny(data, "country_iso"))
+	region := firstNonEmpty(mapStringAny(data, "region"), mapStringAny(data, "region_name"))
+	city := mapStringAny(data, "city")
+	isp := firstNonEmpty(
+		mapStringAny(data, "isp"),
+		mapStringAny(data, "organization"),
+		mapStringAny(data, "org"),
+		mapStringAny(data, "asn_org"),
+		mapStringAny(data, "asn_organization"),
+	)
+	location := normalizeSpace(strings.Join(nonEmptyStrings(country, isp), " "))
+	if location == "" {
+		location = normalizeSpace(strings.Join(nonEmptyStrings(country, region, city), " "))
+	}
+	return map[string]any{
+		"ip":         ip,
+		"public_ip":  ip,
+		"address_ip": ip,
+		"location":   location,
+		"address":    location,
+		"country":    country,
+		"region":     region,
+		"city":       city,
+		"isp":        isp,
+	}
+}
+
+func exitProbeError(source, via string, err error) map[string]any {
+	message := "exit probe failed"
+	if err != nil {
+		message = err.Error()
+	}
+	return map[string]any{
+		"location": "未获取",
+		"address":  "未获取",
+		"ip":       "",
+		"source":   source,
+		"via":      via,
+		"success":  false,
+		"error":    message,
+	}
+}
+
+func normalizeSpace(value string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+}
+
+func mapStringAny(m map[string]any, key string) string {
+	value, ok := m[key]
+	if !ok || value == nil {
+		return ""
+	}
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case float64:
+		if v == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
+}
+
+func nonEmptyStrings(values ...string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func primaryIPForInterface(name string) string {

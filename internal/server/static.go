@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-//go:embed web/dist
+//go:embed web
 var frontendFS embed.FS
 
 func (a *App) registerStatic(mux *http.ServeMux) {
@@ -21,12 +21,17 @@ func (a *App) registerStatic(mux *http.ServeMux) {
 	mux.HandleFunc("GET /ui/{path...}", a.handleMihomoUIAsset)
 
 	sub, err := fs.Sub(frontendFS, "web/dist")
+	if err == nil {
+		_, err = fs.Stat(sub, "index.html")
+	}
 	if err != nil {
-		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("msm-free frontend is not built"))
-		})
-		return
+		sub, err = fs.Sub(frontendFS, "web")
+		if err != nil {
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				writeError(w, http.StatusNotFound, "not_found", "frontend is not built")
+			})
+			return
+		}
 	}
 	fileServer := http.FileServer(http.FS(sub))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

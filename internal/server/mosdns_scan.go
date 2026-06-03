@@ -115,13 +115,14 @@ func (a *App) upsertMosDNSScannedClient(item map[string]string, allowIPs map[str
 	source := firstNonEmpty(strings.TrimSpace(item["source"]), "scan")
 	online := strings.EqualFold(item["online"], "true") || source == "neigh" || strings.Contains(source, "arp")
 	status := "unscanned"
+	listStatus := a.clientListStatusForCurrentMode()
 	var id int64
 	var currentType string
 	err := a.DB.QueryRow(`select id,coalesce(type,'') from mosdns_clients where ip=? order by case when coalesce(mac,'')='' then 1 else 0 end,id desc limit 1`, ip).Scan(&id, &currentType)
 	if err == nil {
 		status = normalizeMosDNSClientStatus(currentType, allowIPs[ip])
 		if allowIPs[ip] {
-			status = "allow"
+			status = listStatus
 		}
 		_, err = a.DB.Exec(`update mosdns_clients set mac=coalesce(nullif(?,''),mac),hostname=coalesce(nullif(?,''),hostname),source=?,type=?,last_seen_at=?,last_scan_at=?,interface=coalesce(nullif(?,''),interface),is_online=?,updated_at=? where id=?`,
 			mac, hostname, source, status, now, now, iface, online, now, id)
@@ -131,7 +132,7 @@ func (a *App) upsertMosDNSScannedClient(item map[string]string, allowIPs map[str
 		return err
 	}
 	if allowIPs[ip] {
-		status = "allow"
+		status = listStatus
 	}
 	_, err = a.DB.Exec(`insert into mosdns_clients(mac,ip,hostname,source,type,first_seen_at,last_seen_at,last_scan_at,interface,is_online,created_at,updated_at)
 		values(?,?,?,?,?,?,?,?,?,?,?,?)`,

@@ -169,6 +169,16 @@ rule-providers:
 rules:
   # 常用必备
   - DST-PORT,123,DIRECT
+  - DOMAIN-SUFFIX,sssaicode.com,DIRECT
+  - DOMAIN-KEYWORD,docker,香港节点
+  - DOMAIN-SUFFIX,eastmoney.com,DIRECT
+  - DOMAIN-SUFFIX,sina.com.cn,DIRECT
+  - DOMAIN-SUFFIX,sinajs.cn,DIRECT
+  - DOMAIN,cdn.12api.org,DIRECT
+  - DOMAIN,cdn.atk.pro,DIRECT
+  - DOMAIN-SUFFIX,brave.com,美国节点
+  - DOMAIN-SUFFIX,arena.ai,美国节点
+  - DOMAIN-SUFFIX,huggingface.co,美国节点
  
   # 自定义代理
   - DOMAIN-SUFFIX,test-ipv6.com,全球直连

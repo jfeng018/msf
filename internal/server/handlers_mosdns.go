@@ -219,6 +219,7 @@ func (a *App) handleMosDNSCacheClear(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleMosDNSClients(w http.ResponseWriter, r *http.Request) {
 	allowIPs := a.mosDNSClientIPSet()
+	proxyMode := a.mosDNSClientProxyMode()
 	rows, err := a.DB.Query(`select id,coalesce(mac,''),ip,coalesce(hostname,''),coalesce(vendor,''),coalesce(custom_name,''),coalesce(custom_desc,''),coalesce(source,''),coalesce(type,''),query_count,first_seen_at,last_seen_at,last_scan_at,coalesce(interface,''),is_online,created_at,updated_at
 		from mosdns_clients`)
 	if err != nil {
@@ -233,12 +234,23 @@ func (a *App) handleMosDNSClients(w http.ResponseWriter, r *http.Request) {
 		var first, last, scan, created, updated sql.NullTime
 		var online bool
 		_ = rows.Scan(&id, &mac, &ip, &hostname, &vendor, &customName, &customDesc, &source, &typ, &count, &first, &last, &scan, &iface, &online, &created, &updated)
-		status := normalizeMosDNSClientStatus(typ, allowIPs[ip])
+		inClientList := allowIPs[ip]
+		status := normalizeMosDNSClientStatus(typ, false)
+		if inClientList {
+			if proxyMode == "black" {
+				status = "deny"
+			} else {
+				status = "allow"
+			}
+		} else if status == "allow" || status == "deny" {
+			status = "unscanned"
+		}
 		name := firstNonEmpty(customName, hostname, ip)
 		items = append(items, map[string]any{
 			"id": id, "mac": mac, "ip": ip, "hostname": hostname, "vendor": vendor, "custom_name": customName, "custom_desc": customDesc,
 			"name": name, "display_name": name,
 			"source": source, "type": status, "status": status, "zone": status, "query_count": count, "interface": iface, "is_online": online, "online": online,
+			"in_client_ip_list": inClientList, "in_list": inClientList, "listed": inClientList,
 			"first_seen_at": nullableTimeString(first), "last_seen_at": nullableTimeString(last), "last_scan_at": nullableTimeString(scan),
 			"created_at": nullableTimeString(created), "updated_at": nullableTimeString(updated),
 		})
@@ -375,20 +387,25 @@ func (a *App) handleMosDNSClientCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "db_error", err.Error())
 		return
 	}
-	if status == "allow" {
-		_ = a.setMosDNSClientIPAllowed(req.IP, true, req.CustomName)
-	}
+	_ = a.setMosDNSClientIPAllowed(req.IP, status == "allow" || status == "deny", req.CustomName)
+	_ = a.applyMosDNSClientActiveStatus()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 
 func (a *App) handleMosDNSClientDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	_ = a.syncMosDNSClientAllowList(id, "unscanned")
+	var ip string
+	_ = a.DB.QueryRow(`select ip from mosdns_clients where id=? or ip=? or mac=? order by id desc limit 1`, id, id, id).Scan(&ip)
 	_, err := a.DB.Exec(`delete from mosdns_clients where id=? or ip=? or mac=?`, id, id, id)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "delete_failed", err.Error())
 		return
 	}
+	if ip != "" {
+		_, _ = a.DB.Exec(`delete from mosdns_client_ips where ip=?`, ip)
+	}
+	_ = a.rewriteMosDNSClientIPFile()
+	_ = a.applyMosDNSClientActiveStatus()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 
@@ -425,7 +442,8 @@ func (a *App) handleMosDNSClientPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if status != "" {
-		_ = a.syncMosDNSClientAllowList(id, status)
+		_ = a.syncMosDNSClientListed(id, status)
+		_ = a.applyMosDNSClientActiveStatus()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
@@ -455,10 +473,11 @@ func (a *App) handleMosDNSClientMove(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "client not found")
 		return
 	}
-	if err := a.syncMosDNSClientAllowList(id, status); err != nil {
+	if err := a.syncMosDNSClientListed(id, status); err != nil {
 		writeError(w, http.StatusBadRequest, "sync_failed", err.Error())
 		return
 	}
+	_ = a.applyMosDNSClientActiveStatus()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"id": id, "status": status, "zone": status}})
 }
 
@@ -519,6 +538,9 @@ func (a *App) handleMosDNSClientIPs(w http.ResponseWriter, r *http.Request) {
 		_ = rows.Scan(&id, &ip, &comment, &created, &updated)
 		items = append(items, map[string]any{"id": id, "ip": ip, "comment": comment, "created_at": nullableTimeString(created), "updated_at": nullableTimeString(updated)})
 	}
+	if items == nil {
+		items = []map[string]any{}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": items})
 }
 
@@ -540,7 +562,7 @@ func (a *App) handleMosDNSClientIPCreate(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "db_error", err.Error())
 		return
 	}
-	_, _ = a.DB.Exec(`update mosdns_clients set type='allow',updated_at=? where ip=?`, time.Now(), req.IP)
+	_, _ = a.DB.Exec(`update mosdns_clients set type=?,updated_at=? where ip=?`, a.clientListStatusForCurrentMode(), time.Now(), req.IP)
 	_ = a.rewriteMosDNSClientIPFile()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
@@ -558,11 +580,17 @@ func (a *App) handleMosDNSClientIPDelete(w http.ResponseWriter, r *http.Request)
 		_, _ = a.DB.Exec(`update mosdns_clients set type='unscanned',updated_at=? where ip=?`, time.Now(), ip)
 	}
 	_ = a.rewriteMosDNSClientIPFile()
+	_ = a.applyMosDNSClientActiveStatus()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 
 func (a *App) handleMosDNSClientProxyMode(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"mode": a.setting("mosdns_client_proxy_mode", "direct_default")}})
+	mode := a.mosDNSClientProxyMode()
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{
+		"mode":     mode,
+		"switch2":  mode == "white",
+		"switch12": mode == "black",
+	}})
 }
 
 func (a *App) handleMosDNSClientProxyModePut(w http.ResponseWriter, r *http.Request) {
@@ -573,11 +601,16 @@ func (a *App) handleMosDNSClientProxyModePut(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	if req.Mode == "" {
-		req.Mode = "direct_default"
+	mode := normalizeMosDNSClientProxyMode(req.Mode)
+	if err := a.setMosDNSClientProxyMode(mode); err != nil {
+		writeError(w, http.StatusBadRequest, "update_failed", err.Error())
+		return
 	}
-	a.setSetting("mosdns_client_proxy_mode", req.Mode)
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"mode": req.Mode}})
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{
+		"mode":     mode,
+		"switch2":  mode == "white",
+		"switch12": mode == "black",
+	}})
 }
 
 func (a *App) handleMosDNSRules(w http.ResponseWriter, r *http.Request) {
@@ -779,9 +812,6 @@ func (a *App) handleMosDNSQueryLog(w http.ResponseWriter, r *http.Request) {
 	}
 	pageEntries := entries[start:end]
 	lines := mosDNSQueryRawLines(pageEntries)
-	if len(lines) == 0 {
-		lines = a.serviceLogLines("mosdns", queryInt(r, "lines", minInt(capacity, 1000)))
-	}
 	payload := map[string]any{
 		"logs":        pageEntries,
 		"items":       pageEntries,
@@ -830,12 +860,36 @@ func (a *App) handleMosDNSAuditStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleMosDNSCacheDetailed(w http.ResponseWriter, r *http.Request) {
+	entries := a.mosDNSQueryDataset(5000)
+	metrics, _ := a.mosDNSProxyMetrics()
+	cacheRows := a.mosDNSCacheOverviewRows(mosDNSMetricCacheCounters(metrics), entries)
+	summary := mosDNSCacheSummaryFromRows(cacheRows)
+	domains := a.mosDNSCacheDomainBuckets(entries)
 	if data, ok := a.mosDNSProxyCache(); ok {
+		if _, ok := data["summary"]; !ok {
+			data["summary"] = summary
+		}
+		if _, ok := data["caches"]; !ok {
+			data["caches"] = cacheRows
+		}
+		if _, ok := data["entries"]; !ok {
+			data["entries"] = mosDNSCacheRows(entries)
+		}
+		if _, ok := data["items"]; !ok {
+			data["items"] = mosDNSCacheRows(entries)
+		}
+		if _, ok := data["domains"]; !ok {
+			data["domains"] = domains
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": data})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{
-		"summary": mosDNSCacheSummary(a.mosDNSQueryDataset(5000)), "caches": mosDNSCacheRows(a.mosDNSQueryDataset(5000)),
+		"summary": summary,
+		"caches":  cacheRows,
+		"entries": mosDNSCacheRows(entries),
+		"items":   mosDNSCacheRows(entries),
+		"domains": domains,
 	}})
 }
 
@@ -847,6 +901,17 @@ func (a *App) handleMosDNSRoutingTask(w http.ResponseWriter, r *http.Request) {
 	scheduler := a.mosDNSRoutingScheduler()
 	state := a.mosDNSRoutingState()
 	state["scheduler"] = scheduler
+	if execution, ok := scheduler["execution_settings"].(map[string]any); ok && len(execution) > 0 {
+		state["execution_settings"] = execution
+	}
+	if days, ok := scheduler["date_range_days"]; ok {
+		execution, _ := state["execution_settings"].(map[string]any)
+		if execution == nil {
+			execution = mosDNSRoutingExecutionDefaults()
+		}
+		execution["date_range_days"] = days
+		state["execution_settings"] = execution
+	}
 	if _, ok := state["execution_settings"]; !ok {
 		state["execution_settings"] = mosDNSRoutingExecutionDefaults()
 	}
@@ -855,7 +920,7 @@ func (a *App) handleMosDNSRoutingTask(w http.ResponseWriter, r *http.Request) {
 
 func mosDNSRoutingExecutionDefaults() map[string]any {
 	return map[string]any{
-		"date_range_days":      7,
+		"date_range_days":      30,
 		"queries_per_second":   5,
 		"resolver_address":     "127.0.0.1:53",
 		"url_call_delay_ms":    100,
@@ -1051,12 +1116,13 @@ func (a *App) handleMosDNSClientIPListPut(w http.ResponseWriter, r *http.Request
 		return
 	}
 	_, _ = a.DB.Exec(`delete from mosdns_client_ips`)
-	_, _ = a.DB.Exec(`update mosdns_clients set type='unscanned',updated_at=? where type='allow'`, time.Now())
+	_, _ = a.DB.Exec(`update mosdns_clients set type='unscanned',updated_at=? where type in ('allow','deny')`, time.Now())
 	now := time.Now()
+	status := a.clientListStatusForCurrentMode()
 	for _, ip := range req.IPs {
 		if net.ParseIP(ip) != nil {
 			_, _ = a.DB.Exec(`insert into mosdns_client_ips(ip,created_at,updated_at) values(?,?,?) on conflict(ip) do nothing`, ip, now, now)
-			_, _ = a.DB.Exec(`update mosdns_clients set type='allow',updated_at=? where ip=?`, now, ip)
+			_, _ = a.DB.Exec(`update mosdns_clients set type=?,updated_at=? where ip=?`, status, now, ip)
 		}
 	}
 	_ = a.rewriteMosDNSClientIPFile()
@@ -1606,7 +1672,7 @@ func (a *App) jsonSetting(key string, fallback any) any {
 }
 
 func (a *App) mosDNSRoutingScheduler() map[string]any {
-	fallback := map[string]any{"enabled": false, "interval": 86400, "interval_minutes": 1440, "start_datetime": time.Now().Format(time.RFC3339)}
+	fallback := map[string]any{"enabled": false, "interval": 2592000, "interval_minutes": 43200, "start_datetime": time.Now().Format(time.RFC3339), "date_range_days": 30}
 	raw := a.jsonSetting("mosdns_routing_scheduler", fallback)
 	scheduler, ok := raw.(map[string]any)
 	if !ok {

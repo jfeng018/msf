@@ -25,8 +25,8 @@ func (a *App) mosDNSQueryDataset(limit int) []map[string]any {
 	if limit <= 0 {
 		limit = 5000
 	}
-	entries := a.mosDNSProxyQueryEntries(limit)
-	if len(entries) == 0 {
+	entries, ok := a.mosDNSProxyQueryEntries(limit)
+	if !ok {
 		entries = mosDNSQueryEntries(a.serviceLogLines("mosdns", limit))
 	}
 	if len(entries) > limit {
@@ -35,8 +35,10 @@ func (a *App) mosDNSQueryDataset(limit int) []map[string]any {
 	return entries
 }
 
-func (a *App) mosDNSProxyQueryEntries(limit int) []map[string]any {
+func (a *App) mosDNSProxyQueryEntries(limit int) ([]map[string]any, bool) {
 	paths := []string{
+		fmt.Sprintf("/api/v2/audit/logs?limit=%d", limit),
+		fmt.Sprintf("/api/v1/audit/logs?limit=%d", limit),
 		fmt.Sprintf("/api/query-logs?limit=%d", limit),
 		fmt.Sprintf("/query-logs?limit=%d", limit),
 		fmt.Sprintf("/plugins/query_log/get?limit=%d", limit),
@@ -44,31 +46,31 @@ func (a *App) mosDNSProxyQueryEntries(limit int) []map[string]any {
 	for _, path := range paths {
 		var raw any
 		if proxyJSON(a.mosDNSAPIURL(path), &raw) {
-			if entries := normalizeMosDNSQueryPayload(raw); len(entries) > 0 {
-				return entries
+			if entries, ok := normalizeMosDNSQueryPayload(raw); ok {
+				return entries, true
 			}
 		}
 	}
-	return nil
+	return nil, false
 }
 
-func normalizeMosDNSQueryPayload(raw any) []map[string]any {
+func normalizeMosDNSQueryPayload(raw any) ([]map[string]any, bool) {
 	switch v := raw.(type) {
 	case []any:
-		return normalizeMosDNSQueryArray(v)
+		return normalizeMosDNSQueryArray(v), true
 	case map[string]any:
 		for _, key := range []string{"data", "logs", "items", "records", "queries"} {
 			if arr, ok := v[key].([]any); ok {
-				return normalizeMosDNSQueryArray(arr)
+				return normalizeMosDNSQueryArray(arr), true
 			}
 			if nested, ok := v[key].(map[string]any); ok {
-				if entries := normalizeMosDNSQueryPayload(nested); len(entries) > 0 {
-					return entries
+				if entries, ok := normalizeMosDNSQueryPayload(nested); ok {
+					return entries, true
 				}
 			}
 		}
 	}
-	return nil
+	return nil, false
 }
 
 func normalizeMosDNSQueryArray(items []any) []map[string]any {

@@ -64,7 +64,7 @@ func TestSetupInitializeLoginAndGeneratedConfigs(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(cfg)
-	for _, want := range []string{"proxy-providers:", "msm_manual:", "https://example.com/a.yaml", "机场A", "机场1", "tproxy-port: 7896", "listen: 0.0.0.0:6666", "fake-ip-range: 28.0.0.1/8", "UrlTest: &UrlTest", "proxies: [DIRECT], include-all: true, include-all-proxies: true, include-all-providers: true", "name: 机场节点, type: select, proxies: [DIRECT], include-all: true, include-all-proxies: true, include-all-providers: true"} {
+	for _, want := range []string{"proxy-providers:", "msm_manual:", "https://example.com/a.yaml", "机场A", "机场1", "tproxy-port: 7896", "listen: 0.0.0.0:6666", "fake-ip-range: 28.0.0.1/8", "UrlTest: &UrlTest", "DOMAIN-SUFFIX,sssaicode.com,DIRECT", "DOMAIN-SUFFIX,huggingface.co,美国节点", "proxies: [DIRECT], include-all: true, include-all-proxies: true, include-all-providers: true", "name: 机场节点, type: select, proxies: [DIRECT], include-all: true, include-all-proxies: true, include-all-providers: true"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("mihomo config missing %q:\n%s", want, text)
 		}
@@ -340,6 +340,31 @@ func TestStructuredMSMJSONLogsFormatLikeOriginal(t *testing.T) {
 	}
 }
 
+func TestStructuredServiceLogsSplitTimeLevelAndMessage(t *testing.T) {
+	entries := structuredLogLines([]string{
+		`time="2026-06-02T15:50:44.905225194+08:00" level=info msg="[TCP] 127.0.0.1:44074 --> 127.0.0.1:7877 match Match using 漏网之鱼[placeholder-node-1]"`,
+		`2026/05/31 12:43:58 [adguard_rule] working directory is: adguard/`,
+	})
+	if len(entries) != 2 {
+		t.Fatalf("entries len=%d", len(entries))
+	}
+	if got := fmtAny(entries[0]["time"]); got != "2026-06-02T15:50:44.905225194+08:00" {
+		t.Fatalf("mihomo logfmt time mismatch: %q", got)
+	}
+	if got := fmtAny(entries[0]["level"]); got != "info" {
+		t.Fatalf("mihomo logfmt level mismatch: %q", got)
+	}
+	if got := fmtAny(entries[0]["message"]); strings.Contains(got, `time=`) || !strings.HasPrefix(got, "[TCP] ") {
+		t.Fatalf("mihomo logfmt message was not split: %q", got)
+	}
+	if got := fmtAny(entries[1]["time"]); got != "2026-05-31 12:43:58" {
+		t.Fatalf("mosdns slash time mismatch: %q", got)
+	}
+	if got := fmtAny(entries[1]["message"]); strings.Contains(got, "2026/05/31") || !strings.HasPrefix(got, "[adguard_rule] ") {
+		t.Fatalf("mosdns message was not split: %q", got)
+	}
+}
+
 func TestSetupDownloadSkipIfExists(t *testing.T) {
 	app := newTestApp(t)
 	target := app.componentTarget("mihomo")
@@ -591,6 +616,32 @@ func TestMosDNS9099TakesPriorityForQueryLogsAndOverview(t *testing.T) {
 	}
 }
 
+func TestMosDNSQueryLogsKeepEmpty9099AuditResult(t *testing.T) {
+	app := newTestApp(t)
+	token := tokenForRole(t, app, "admin")
+	if err := os.WriteFile(filepath.Join(app.DataDir, "logs/mosdns.out.log"), []byte(`client_ip=192.168.10.9 query_name=local.example qtype=A rule=local rcode=NOERROR`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/audit/logs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"pagination": map[string]any{"total_items": 0, "total_pages": 0, "current_page": 1, "items_per_page": 100},
+				"logs":       []any{},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	app.setSetting("mosdns_api_endpoint", api.URL)
+
+	logs := requestJSON(t, app, http.MethodGet, "/api/v1/mosdns/query-logs", token, nil)
+	if logs.Code != http.StatusOK || strings.Contains(logs.Body.String(), "local.example") || !strings.Contains(logs.Body.String(), `"logs":[]`) {
+		t.Fatalf("empty 9099 audit result should not fall back to service logs: status=%d body=%s", logs.Code, logs.Body.String())
+	}
+}
+
 func TestMosDNSClientMoveSyncsWhitelistFile(t *testing.T) {
 	app := newTestApp(t)
 	token := tokenForRole(t, app, "admin")
@@ -625,6 +676,73 @@ func TestMosDNSClientMoveSyncsWhitelistFile(t *testing.T) {
 	}
 	if strings.Contains(string(listFile), "192.168.10.88") {
 		t.Fatalf("client_ip.txt should remove disabled client: %s", string(listFile))
+	}
+}
+
+func TestMosDNSClientProxyModeKeepsSingleClientIPList(t *testing.T) {
+	app := newTestApp(t)
+	token := tokenForRole(t, app, "admin")
+	create := requestJSON(t, app, http.MethodPost, "/api/v1/mosdns/clients", token, map[string]any{
+		"ip": "192.168.10.90", "hostname": "listed-client",
+	})
+	if create.Code != http.StatusOK {
+		t.Fatalf("create client status=%d body=%s", create.Code, create.Body.String())
+	}
+	move := requestJSON(t, app, http.MethodPost, "/api/v1/mosdns/clients/192.168.10.90/move", token, map[string]string{"status": "allow"})
+	if move.Code != http.StatusOK {
+		t.Fatalf("move status=%d body=%s", move.Code, move.Body.String())
+	}
+	black := requestJSON(t, app, http.MethodPost, "/api/v1/mosdns/client-proxy-mode", token, map[string]string{"mode": "black"})
+	if black.Code != http.StatusOK {
+		t.Fatalf("black mode status=%d body=%s", black.Code, black.Body.String())
+	}
+	listFile, err := os.ReadFile(filepath.Join(app.DataDir, "configs/mosdns/client_ip.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(listFile), "192.168.10.90") {
+		t.Fatalf("client_ip.txt should keep the single active list after black mode: %s", string(listFile))
+	}
+	switch2, err := os.ReadFile(filepath.Join(app.DataDir, "configs/mosdns/rule/switch2.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch12, err := os.ReadFile(filepath.Join(app.DataDir, "configs/mosdns/rule/switch12.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(switch2)) != "B" || strings.TrimSpace(string(switch12)) != "A" {
+		t.Fatalf("black mode should set switch2=B switch12=A, got switch2=%q switch12=%q", string(switch2), string(switch12))
+	}
+	clients := requestJSON(t, app, http.MethodGet, "/api/v1/mosdns/clients", token, nil)
+	if clients.Code != http.StatusOK || !strings.Contains(clients.Body.String(), `"status":"deny"`) || !strings.Contains(clients.Body.String(), `"in_client_ip_list":true`) {
+		t.Fatalf("black mode clients response mismatch: status=%d body=%s", clients.Code, clients.Body.String())
+	}
+	off := requestJSON(t, app, http.MethodPost, "/api/v1/mosdns/client-proxy-mode", token, map[string]string{"mode": "off"})
+	if off.Code != http.StatusOK {
+		t.Fatalf("off mode status=%d body=%s", off.Code, off.Body.String())
+	}
+	listFile, err = os.ReadFile(filepath.Join(app.DataDir, "configs/mosdns/client_ip.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(listFile), "192.168.10.90") {
+		t.Fatalf("client_ip.txt should remain available while mode is off: %s", string(listFile))
+	}
+	white := requestJSON(t, app, http.MethodPost, "/api/v1/mosdns/client-proxy-mode", token, map[string]string{"mode": "white"})
+	if white.Code != http.StatusOK {
+		t.Fatalf("white mode status=%d body=%s", white.Code, white.Body.String())
+	}
+	switch2, err = os.ReadFile(filepath.Join(app.DataDir, "configs/mosdns/rule/switch2.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch12, err = os.ReadFile(filepath.Join(app.DataDir, "configs/mosdns/rule/switch12.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(switch2)) != "A" || strings.TrimSpace(string(switch12)) != "B" {
+		t.Fatalf("white mode should set switch2=A switch12=B, got switch2=%q switch12=%q", string(switch2), string(switch12))
 	}
 }
 
@@ -835,6 +953,23 @@ func TestMihomoProviderConfigManagementCreatesHistory(t *testing.T) {
 	defer api.Close()
 	app.setSetting("mihomo_controller_endpoint", api.URL)
 
+	runtimeList := requestJSON(t, app, http.MethodGet, "/api/v1/mihomo/proxy-providers", token, nil)
+	if runtimeList.Code != http.StatusOK {
+		t.Fatalf("runtime proxy provider list status=%d body=%s", runtimeList.Code, runtimeList.Body.String())
+	}
+	var runtimeBody map[string]any
+	if err := json.Unmarshal(runtimeList.Body.Bytes(), &runtimeBody); err != nil {
+		t.Fatal(err)
+	}
+	runtimeData, _ := runtimeBody["data"].(map[string]any)
+	if items := anyMapSlice(runtimeData["items"]); len(items) != 0 {
+		t.Fatalf("runtime-only providers should not be editable config items: %s", runtimeList.Body.String())
+	}
+	runtimeItems := anyMapSlice(runtimeData["runtime_items"])
+	if len(runtimeItems) != 1 || stringMapValue(runtimeItems[0], "name") != "airport" {
+		t.Fatalf("runtime_items should expose non-compatible controller providers only: %s", runtimeList.Body.String())
+	}
+
 	put := requestJSON(t, app, http.MethodPut, "/api/v1/mihomo/proxy-providers/airport", token, map[string]any{
 		"url":      "https://example.com/sub.yaml",
 		"interval": 3600,
@@ -887,6 +1022,10 @@ func TestMihomoConfigAndLogPanelCompatibility(t *testing.T) {
 	logs := requestJSON(t, app, http.MethodGet, "/api/v1/mihomo/logs?level=warn&search=provider", token, nil)
 	if logs.Code != http.StatusOK || !strings.Contains(logs.Body.String(), "proxy provider failed") || strings.Contains(logs.Body.String(), "started") {
 		t.Fatalf("mihomo logs filtering mismatch: status=%d body=%s", logs.Code, logs.Body.String())
+	}
+	config := requestJSON(t, app, http.MethodGet, "/api/v1/mihomo/config", token, nil)
+	if config.Code != http.StatusOK || !strings.Contains(config.Body.String(), "proxy-providers:") || !strings.Contains(config.Body.String(), "DOMAIN-SUFFIX,sssaicode.com,DIRECT") {
+		t.Fatalf("mihomo raw config should expose complete config.yaml: status=%d body=%s", config.Code, config.Body.String())
 	}
 	put := requestJSON(t, app, http.MethodPut, "/api/v1/mihomo/config/config.yaml", token, map[string]any{"content": "mode: rule\nmixed-port: 7892\n"})
 	if put.Code != http.StatusOK || !strings.Contains(put.Body.String(), `"restart_required":true`) {
@@ -1305,7 +1444,8 @@ func newFakeMihomoController(t *testing.T) *httptest.Server {
 			}})
 		case "/providers/proxies":
 			_ = json.NewEncoder(w).Encode(map[string]any{"providers": map[string]any{
-				"airport": map[string]any{"name": "airport", "vehicleType": "HTTP", "updatedAt": "2026-05-30T10:00:00Z", "proxies": []any{}},
+				"airport":    map[string]any{"name": "airport", "vehicleType": "HTTP", "updatedAt": "2026-05-30T10:00:00Z", "proxies": []any{}},
+				"compatible": map[string]any{"name": "compatible", "vehicleType": "Compatible", "updatedAt": "2026-05-30T10:00:00Z", "proxies": []any{}},
 			}})
 		case "/providers/proxies/airport":
 			_ = json.NewEncoder(w).Encode(map[string]any{"name": "airport", "vehicleType": "HTTP", "updatedAt": "2026-05-30T10:00:00Z", "proxies": []any{}})

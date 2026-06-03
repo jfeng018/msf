@@ -64,6 +64,13 @@ func (a *App) mihomoFullSnapshot() map[string]any {
 		"redir":      a.tcpPortOpen("127.0.0.1", ports["redir"]),
 		"tproxy":     a.tcpPortOpen("127.0.0.1", ports["tproxy"]),
 	}
+	proxyProviders := anyMapSlice(providers["proxy_providers"])
+	proxyProviderCount := len(proxyProviders)
+	if proxyProviderCount == 0 {
+		if proxyProviderPayload, ok := providers["proxy"].(map[string]any); ok {
+			proxyProviderCount = len(anyMapSlice(proxyProviderPayload["runtime_items"]))
+		}
+	}
 	snapshot := map[string]any{
 		"service":              service,
 		"status":               service.Status,
@@ -91,7 +98,7 @@ func (a *App) mihomoFullSnapshot() map[string]any {
 		"rules":                rules,
 		"rule_count":           rules["total"],
 		"providers":            providers,
-		"proxy_provider_count": len(anyMapSlice(providers["proxy_providers"])),
+		"proxy_provider_count": proxyProviderCount,
 		"rule_provider_count":  len(anyMapSlice(providers["rule_providers"])),
 		"config":               map[string]any{"path": "configs/mihomo/config.yaml", "active": a.setting("mihomo.active_config", "config.yaml")},
 	}
@@ -581,7 +588,7 @@ func (a *App) mihomoProxiesPayload(r *http.Request) map[string]any {
 	if !ok {
 		rawProviders = map[string]any{"providers": map[string]any{}}
 	}
-	proxyMap, groups, proxies := normalizeMihomoProxies(rawProxies)
+	proxyMap, groups, proxies := normalizeMihomoProxies(rawProxies, a.mihomoProxyGroupOrder())
 	if r != nil {
 		search := strings.ToLower(strings.TrimSpace(firstNonEmpty(r.URL.Query().Get("search"), r.URL.Query().Get("q"))))
 		if search != "" {
@@ -601,7 +608,21 @@ func (a *App) mihomoProxiesPayload(r *http.Request) map[string]any {
 	}
 }
 
-func normalizeMihomoProxies(raw map[string]any) (map[string]any, []map[string]any, []map[string]any) {
+func (a *App) mihomoProxyGroupOrder() map[string]int {
+	cfg := a.mihomoConfigMap()
+	out := map[string]int{}
+	for index, item := range anySlice(cfg["proxy-groups"]) {
+		if group, ok := item.(map[string]any); ok {
+			name := stringMapValue(group, "name")
+			if name != "" {
+				out[name] = index
+			}
+		}
+	}
+	return out
+}
+
+func normalizeMihomoProxies(raw map[string]any, groupOrder map[string]int) (map[string]any, []map[string]any, []map[string]any) {
 	proxyMap, _ := raw["proxies"].(map[string]any)
 	byName := map[string]any{}
 	var groups []map[string]any
@@ -613,12 +634,18 @@ func normalizeMihomoProxies(raw map[string]any) (map[string]any, []map[string]an
 			continue
 		}
 		all := stringSlice(item["all"])
+		order, hasOrder := groupOrder[firstNonEmpty(stringMapValue(item, "name"), name)]
+		if !hasOrder {
+			order = 100000
+		}
 		row := map[string]any{
 			"name":          firstNonEmpty(stringMapValue(item, "name"), name),
 			"type":          stringMapValue(item, "type"),
 			"now":           stringMapValue(item, "now"),
 			"all":           all,
 			"all_count":     len(all),
+			"order":         order,
+			"config_order":  order,
 			"udp":           boolMapValue(item, "udp", false),
 			"delay":         latestProxyDelay(item),
 			"history":       item["history"],
@@ -639,7 +666,14 @@ func normalizeMihomoProxies(raw map[string]any) (map[string]any, []map[string]an
 			proxies = append(proxies, row)
 		}
 	}
-	sort.Slice(groups, func(i, j int) bool { return stringMapValue(groups[i], "name") < stringMapValue(groups[j], "name") })
+	sort.Slice(groups, func(i, j int) bool {
+		oi, _ := groups[i]["order"].(int)
+		oj, _ := groups[j]["order"].(int)
+		if oi != oj {
+			return oi < oj
+		}
+		return stringMapValue(groups[i], "name") < stringMapValue(groups[j], "name")
+	})
 	sort.Slice(proxies, func(i, j int) bool { return stringMapValue(proxies[i], "name") < stringMapValue(proxies[j], "name") })
 	return byName, groups, proxies
 }
@@ -746,8 +780,9 @@ func (a *App) mihomoProxyProvidersPayload() map[string]any {
 	if ok {
 		runtime = normalizeProviderMap(raw["providers"])
 	}
+	runtimeItems := runtimeProviderItems(runtime, "proxy")
 	items := mergeProviders(configProviders, runtime, "proxy")
-	return map[string]any{"proxy-providers": cfg["proxy-providers"], "items": items, "providers": items, "runtime": runtime}
+	return map[string]any{"proxy-providers": cfg["proxy-providers"], "items": items, "providers": items, "runtime": runtime, "runtime_items": runtimeItems, "runtime_providers": runtimeItems}
 }
 
 func (a *App) mihomoRuleProvidersPayload() map[string]any {
@@ -758,8 +793,9 @@ func (a *App) mihomoRuleProvidersPayload() map[string]any {
 	if ok {
 		runtime = normalizeProviderMap(raw["providers"])
 	}
+	runtimeItems := runtimeProviderItems(runtime, "rule")
 	items := mergeProviders(configProviders, runtime, "rule")
-	return map[string]any{"rule-providers": cfg["rule-providers"], "items": items, "providers": items, "runtime": runtime}
+	return map[string]any{"rule-providers": cfg["rule-providers"], "items": items, "providers": items, "runtime": runtime, "runtime_items": runtimeItems, "runtime_providers": runtimeItems}
 }
 
 func (a *App) handleMihomoProxyProviderGet(w http.ResponseWriter, r *http.Request) {
@@ -1029,15 +1065,8 @@ func normalizeProviderMap(raw any) map[string]map[string]any {
 }
 
 func mergeProviders(config, runtime map[string]map[string]any, kind string) []map[string]any {
-	names := map[string]bool{}
+	sorted := make([]string, 0, len(config))
 	for name := range config {
-		names[name] = true
-	}
-	for name := range runtime {
-		names[name] = true
-	}
-	sorted := make([]string, 0, len(names))
-	for name := range names {
 		sorted = append(sorted, name)
 	}
 	sort.Strings(sorted)
@@ -1058,6 +1087,36 @@ func mergeProviders(config, runtime map[string]map[string]any, kind string) []ma
 		items = append(items, item)
 	}
 	return items
+}
+
+func runtimeProviderItems(runtime map[string]map[string]any, kind string) []map[string]any {
+	sorted := make([]string, 0, len(runtime))
+	for name, item := range runtime {
+		if providerVehicleType(item) == "compatible" {
+			continue
+		}
+		sorted = append(sorted, name)
+	}
+	sort.Strings(sorted)
+	items := make([]map[string]any, 0, len(sorted))
+	for _, name := range sorted {
+		item := map[string]any{"name": name, "provider_type": kind, "source": "controller"}
+		for k, v := range runtime[name] {
+			item[k] = v
+		}
+		item["updated_at"] = firstNonEmpty(stringMapValue(runtime[name], "updatedAt"), stringMapValue(runtime[name], "updated_at"))
+		item["vehicle_type"] = stringMapValue(runtime[name], "vehicleType")
+		items = append(items, item)
+	}
+	return items
+}
+
+func providerVehicleType(item map[string]any) string {
+	return strings.ToLower(strings.TrimSpace(firstNonEmpty(
+		stringMapValue(item, "vehicleType"),
+		stringMapValue(item, "vehicle_type"),
+		stringMapValue(item, "vehicle-type"),
+	)))
 }
 
 func (a *App) handleMihomoUIConfig(w http.ResponseWriter, r *http.Request) {

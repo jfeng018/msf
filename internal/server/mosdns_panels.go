@@ -1,16 +1,28 @@
 package server
 
 import (
+	"compress/gzip"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+)
+
+var (
+	logfmtFieldRE        = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_-]*)=("[^"]*"|\S+)`)
+	leadingDateTimeRE    = regexp.MustCompile(`^\s*(\d{4}[-/]\d{2}[-/]\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?)(?:\s+(.*))?$`)
+	leadingRFC3339TimeRE = regexp.MustCompile(`^\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))(?:\s+(.*))?$`)
+	cacheDomainRE        = regexp.MustCompile(`[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}\.)+[A-Za-z]{2,}\.?`)
 )
 
 func (a *App) mosDNSAPIBase() string {
@@ -39,6 +51,11 @@ func (a *App) mosDNSSnapshot(limit int) map[string]any {
 	entries := a.mosDNSQueryDataset(limit)
 	audit := mosDNSAuditStats(entries)
 	cache := mosDNSCacheSummary(entries)
+	metrics, metricsOK := a.mosDNSProxyMetrics()
+	cacheCounters := mosDNSMetricCacheCounters(metrics)
+	if metricsOK && len(cacheCounters) > 0 {
+		cache = mosDNSCacheSummaryFromRows(a.mosDNSCacheOverviewRows(cacheCounters, entries))
+	}
 	if remoteCache, ok := a.mosDNSProxyCache(); ok {
 		if summary, ok := remoteCache["summary"].(map[string]any); ok {
 			cache = summary
@@ -67,13 +84,7 @@ func (a *App) mosDNSSnapshot(limit int) map[string]any {
 		"summary": cache,
 		"entries": mosDNSCacheRows(entries),
 		"items":   mosDNSCacheRows(entries),
-		"caches": map[string]any{
-			"fallback": map[string]any{
-				"query_total": cache["query_total"],
-				"hit_total":   cache["hit_total"],
-				"hit_rate":    cache["hit_rate"],
-			},
-		},
+		"caches":  a.mosDNSCacheOverviewRows(cacheCounters, entries),
 	}
 	if remoteCache, ok := a.mosDNSProxyCache(); ok {
 		detailedCache = remoteCache
@@ -81,7 +92,7 @@ func (a *App) mosDNSSnapshot(limit int) map[string]any {
 			detailedCache["summary"] = cache
 		}
 		if _, ok := detailedCache["caches"]; !ok {
-			detailedCache["caches"] = map[string]any{"remote": map[string]any{"query_total": queryCount, "hit_total": cacheEntries, "hit_rate": cache["hit_rate"]}}
+			detailedCache["caches"] = a.mosDNSCacheOverviewRows(cacheCounters, entries)
 		}
 	}
 	stats := map[string]any{
@@ -99,6 +110,14 @@ func (a *App) mosDNSSnapshot(limit int) map[string]any {
 	}
 	if remoteOK {
 		for key, value := range remoteStats {
+			stats[key] = value
+		}
+	}
+	if metricsOK {
+		for key, value := range metrics {
+			if key == "cache_counters" {
+				continue
+			}
 			stats[key] = value
 		}
 	}
@@ -203,6 +222,551 @@ func (a *App) mosDNSProxyCache() (map[string]any, bool) {
 	return nil, false
 }
 
+func (a *App) mosDNSProxyMetrics() (map[string]any, bool) {
+	text, ok := proxyText(a.mosDNSAPIURL("/metrics"))
+	if !ok || strings.TrimSpace(text) == "" {
+		return nil, false
+	}
+	parsed := parsePrometheusMetrics(text)
+	return parsed, len(parsed) > 0
+}
+
+func parsePrometheusMetrics(text string) map[string]any {
+	stats := map[string]any{}
+	cacheCounters := map[string]map[string]any{}
+	lines := strings.Split(text, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		series := fields[0]
+		value, err := strconv.ParseFloat(fields[len(fields)-1], 64)
+		if err != nil {
+			continue
+		}
+		name, labels := splitPrometheusSeries(series)
+		if name == "" {
+			continue
+		}
+		switch name {
+		case "go_goroutines":
+			stats["go_goroutines"] = value
+		case "go_threads":
+			stats["go_threads"] = value
+		case "go_memstats_heap_alloc_bytes", "go_memstats_alloc_bytes":
+			stats["go_heap_alloc_bytes"] = value
+		case "go_memstats_heap_idle_bytes":
+			stats["go_heap_idle_bytes"] = value
+		case "go_memstats_heap_objects":
+			stats["go_heap_objects"] = value
+		case "go_gc_duration_seconds_sum":
+			stats["go_gc_duration_sec"] = value
+		case "go_gc_duration_seconds_count":
+			stats["go_gc_count"] = value
+		case "process_open_fds":
+			stats["open_fds"] = value
+		case "process_max_fds":
+			stats["max_fds"] = value
+		case "process_resident_memory_bytes":
+			stats["process_rss_bytes"] = value
+		}
+		if strings.HasPrefix(name, "mosdns_cache_") {
+			tag := labels["tag"]
+			if tag == "" {
+				continue
+			}
+			row := cacheCounters[tag]
+			if row == nil {
+				row = map[string]any{"tag": tag, "name": tag}
+				cacheCounters[tag] = row
+			}
+			switch name {
+			case "mosdns_cache_query_total":
+				row["query_total"] = value
+				row["total"] = value
+			case "mosdns_cache_hit_total":
+				row["hit_total"] = value
+				row["hits"] = value
+			case "mosdns_cache_lazy_hit_total":
+				row["stale_hit_total"] = value
+				row["lazy_hit_total"] = value
+				row["stale_hits"] = value
+			case "mosdns_cache_size_current":
+				row["entries"] = value
+				row["size"] = value
+				row["entry_count"] = value
+			}
+		}
+	}
+	for _, row := range cacheCounters {
+		fillMosDNSCacheRates(row)
+	}
+	if len(cacheCounters) > 0 {
+		stats["cache_counters"] = cacheCounters
+	}
+	return stats
+}
+
+func splitPrometheusSeries(series string) (string, map[string]string) {
+	labels := map[string]string{}
+	idx := strings.IndexByte(series, '{')
+	if idx < 0 {
+		return series, labels
+	}
+	name := strings.TrimSpace(series[:idx])
+	end := strings.LastIndexByte(series, '}')
+	if end <= idx {
+		return name, labels
+	}
+	rawLabels := series[idx+1 : end]
+	for _, part := range strings.Split(rawLabels, ",") {
+		key, value, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.Trim(strings.TrimSpace(value), `"`)
+		value = strings.ReplaceAll(value, `\"`, `"`)
+		value = strings.ReplaceAll(value, `\\`, `\`)
+		if key != "" {
+			labels[key] = value
+		}
+	}
+	return name, labels
+}
+
+func mosDNSMetricCacheCounters(metrics map[string]any) map[string]map[string]any {
+	raw, _ := metrics["cache_counters"].(map[string]map[string]any)
+	if raw != nil {
+		return raw
+	}
+	out := map[string]map[string]any{}
+	if m, ok := metrics["cache_counters"].(map[string]any); ok {
+		for tag, value := range m {
+			if row, ok := value.(map[string]any); ok {
+				out[tag] = row
+			}
+		}
+	}
+	return out
+}
+
+func (a *App) mosDNSCacheOverviewRows(counters map[string]map[string]any, entries []map[string]any) map[string]any {
+	rows := map[string]any{
+		"all":      a.mosDNSCacheOverviewRow("全部缓存", []string{"cache_all", "cache_all_noleak"}, counters, entries, "all"),
+		"domestic": a.mosDNSCacheOverviewRow("国内缓存", []string{"cache_cn", "cache_cnmihomo"}, counters, entries, "domestic"),
+		"foreign":  a.mosDNSCacheOverviewRow("国外缓存", []string{"cache_google"}, counters, entries, "foreign"),
+		"node":     a.mosDNSCacheOverviewRow("节点缓存", []string{"cache_node", "cache_google_node"}, counters, entries, "node"),
+	}
+	return rows
+}
+
+func (a *App) mosDNSCacheDomainBuckets(entries []map[string]any) map[string]any {
+	buckets := map[string][]map[string]any{
+		"realIp": a.mosDNSCacheDumpDomainRows([]string{"cache_all", "cache_all_noleak", "cache_cn", "cache_cnmihomo", "cache_google", "cache_node", "cache_google_node"}, 1000),
+		"fakeIp": {},
+		"noV4":   {},
+		"noV6":   {},
+	}
+	seen := map[string]map[string]bool{
+		"realIp": {},
+		"fakeIp": {},
+		"noV4":   {},
+		"noV6":   {},
+	}
+	for _, row := range buckets["realIp"] {
+		seen["realIp"][stringMapValue(row, "domain")] = true
+	}
+	for _, entry := range entries {
+		domain := normalizeCacheDomainCandidate(stringMapValue(entry, "query_name"))
+		if domain == "" {
+			continue
+		}
+		bucket := "realIp"
+		rule := strings.ToLower(stringMapValue(entry, "domain_set") + " " + stringMapValue(entry, "rule"))
+		switch {
+		case strings.Contains(rule, "nov4") || strings.Contains(rule, "no_v4"):
+			bucket = "noV4"
+		case strings.Contains(rule, "nov6") || strings.Contains(rule, "no_v6"):
+			bucket = "noV6"
+		case entryHasFakeIP(entry):
+			bucket = "fakeIp"
+		}
+		if seen[bucket][domain] {
+			continue
+		}
+		seen[bucket][domain] = true
+		buckets[bucket] = append(buckets[bucket], map[string]any{
+			"id":     fmt.Sprintf("%010d", len(buckets[bucket])+1),
+			"domain": domain,
+			"date":   dateOnly(stringMapValue(entry, "query_time")),
+			"source": "query-log",
+		})
+	}
+	out := map[string]any{}
+	for key, rows := range buckets {
+		for i := range rows {
+			if rows[i]["id"] == nil || rows[i]["id"] == "" {
+				rows[i]["id"] = fmt.Sprintf("%010d", i+1)
+			}
+		}
+		out[key] = rows
+	}
+	return out
+}
+
+func (a *App) mosDNSCacheDumpDomainRows(tags []string, limit int) []map[string]any {
+	seen := map[string]bool{}
+	var rows []map[string]any
+	for _, tag := range tags {
+		for _, domain := range a.mosDNSCacheDumpDomains(tag, limit) {
+			if domain == "" || seen[domain] {
+				continue
+			}
+			seen[domain] = true
+			rows = append(rows, map[string]any{
+				"id":     fmt.Sprintf("%010d", len(rows)+1),
+				"domain": domain,
+				"source": tag,
+			})
+			if limit > 0 && len(rows) >= limit {
+				return rows
+			}
+		}
+	}
+	return rows
+}
+
+func (a *App) mosDNSCacheOverviewRow(title string, tags []string, counters map[string]map[string]any, entries []map[string]any, bucket string) map[string]any {
+	row := map[string]any{"name": title, "title": title, "tags": tags}
+	var queryTotal, hitTotal, staleHitTotal, entryCount float64
+	usedMetrics := false
+	for _, tag := range tags {
+		counter := counters[tag]
+		if len(counter) > 0 {
+			usedMetrics = true
+		}
+		queryTotal += numericAny(counter["query_total"])
+		hitTotal += numericAny(counter["hit_total"])
+		staleHitTotal += firstNumberAny(counter, "stale_hit_total", "lazy_hit_total", "stale_hits")
+		entryCount += firstNumberAny(counter, "entries", "size", "entry_count")
+	}
+	if entryCount == 0 {
+		for _, tag := range tags {
+			entryCount += float64(a.mosDNSCacheDumpEntryCount(tag))
+		}
+	}
+	if !usedMetrics || (queryTotal == 0 && hitTotal == 0 && staleHitTotal == 0 && entryCount == 0 && len(entries) > 0) {
+		queryTotal, hitTotal, staleHitTotal = mosDNSCacheFallbackTotals(entries, bucket)
+		if entryCount == 0 {
+			entryCount = hitTotal
+		}
+	}
+	row["query_total"] = queryTotal
+	row["total"] = queryTotal
+	row["hit_total"] = hitTotal
+	row["hits"] = hitTotal
+	row["stale_hit_total"] = staleHitTotal
+	row["lazy_hit_total"] = staleHitTotal
+	row["stale_hits"] = staleHitTotal
+	row["miss_total"] = maxFloat64(0, queryTotal-hitTotal)
+	row["misses"] = row["miss_total"]
+	row["entries"] = entryCount
+	row["size"] = entryCount
+	row["entry_count"] = entryCount
+	fillMosDNSCacheRates(row)
+	return row
+}
+
+func mosDNSCacheFallbackTotals(entries []map[string]any, bucket string) (float64, float64, float64) {
+	if bucket == "all" {
+		cacheRows := mosDNSCacheRows(entries)
+		return float64(len(entries)), float64(len(cacheRows)), 0
+	}
+	var total float64
+	var hits float64
+	for _, entry := range entries {
+		if !mosDNSCacheEntryMatchesBucket(entry, bucket) {
+			continue
+		}
+		total++
+		if len(anySlice(entry["answers"])) > 0 || entryHasFakeIP(entry) {
+			hits++
+		}
+	}
+	return total, hits, 0
+}
+
+func mosDNSCacheEntryMatchesBucket(entry map[string]any, bucket string) bool {
+	rule := strings.ToLower(stringMapValue(entry, "domain_set") + " " + stringMapValue(entry, "rule"))
+	switch bucket {
+	case "domestic":
+		return strings.Contains(rule, "cn") || strings.Contains(rule, "realip") || strings.Contains(rule, "white") || strings.Contains(rule, "direct")
+	case "foreign":
+		return strings.Contains(rule, "no_cn") || strings.Contains(rule, "!cn") || strings.Contains(rule, "fakeip") || strings.Contains(rule, "google")
+	case "node":
+		return strings.Contains(rule, "node") || strings.Contains(rule, "nodenov")
+	default:
+		return true
+	}
+}
+
+func fillMosDNSCacheRates(row map[string]any) {
+	total := numericAny(row["query_total"])
+	hits := numericAny(row["hit_total"])
+	stale := firstNumberAny(row, "stale_hit_total", "lazy_hit_total", "stale_hits")
+	if total > 0 {
+		row["hit_rate"] = hits * 100 / total
+		row["stale_hit_rate"] = stale * 100 / total
+		row["lazy_hit_rate"] = stale * 100 / total
+		return
+	}
+	if _, ok := row["hit_rate"]; !ok {
+		row["hit_rate"] = 0.0
+	}
+	if _, ok := row["stale_hit_rate"]; !ok {
+		row["stale_hit_rate"] = 0.0
+	}
+	if _, ok := row["lazy_hit_rate"]; !ok {
+		row["lazy_hit_rate"] = 0.0
+	}
+}
+
+func firstNumberAny(row map[string]any, keys ...string) float64 {
+	for _, key := range keys {
+		if value, ok := row[key]; ok {
+			return numericAny(value)
+		}
+	}
+	return 0
+}
+
+func maxFloat64(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func mosDNSCacheSummaryFromRows(rows map[string]any) map[string]any {
+	all, _ := rows["all"].(map[string]any)
+	if len(all) == 0 {
+		return map[string]any{"entries": 0, "size": 0, "hit_rate": 0, "query_total": 0, "hit_total": 0, "stale_hit_total": 0}
+	}
+	return map[string]any{
+		"entries":         all["entries"],
+		"size":            all["size"],
+		"hit_rate":        all["hit_rate"],
+		"stale_hit_rate":  all["stale_hit_rate"],
+		"query_total":     all["query_total"],
+		"hit_total":       all["hit_total"],
+		"stale_hit_total": all["stale_hit_total"],
+	}
+}
+
+func (a *App) mosDNSCacheDumpEntryCount(tag string) int {
+	if tag == "" {
+		return 0
+	}
+	rel := filepath.ToSlash(filepath.Join("configs/mosdns/cache", tag+".dump"))
+	abs, err := a.safePath(rel)
+	if err != nil {
+		return 0
+	}
+	f, err := os.Open(abs)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return 0
+	}
+	defer gr.Close()
+	if gr.Name != "mosdns_cache_v2" {
+		return 0
+	}
+	var total int
+	var header [8]byte
+	for {
+		if _, err := io.ReadFull(gr, header[:]); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			return total
+		}
+		length := binary.BigEndian.Uint64(header[:])
+		if length == 0 {
+			continue
+		}
+		if length > 1<<20 {
+			return total
+		}
+		block := make([]byte, int(length))
+		if _, err := io.ReadFull(gr, block); err != nil {
+			return total
+		}
+		total += countMosDNSCacheDumpBlockEntries(block)
+	}
+	return total
+}
+
+func (a *App) mosDNSCacheDumpDomains(tag string, limit int) []string {
+	if tag == "" {
+		return nil
+	}
+	rel := filepath.ToSlash(filepath.Join("configs/mosdns/cache", tag+".dump"))
+	abs, err := a.safePath(rel)
+	if err != nil {
+		return nil
+	}
+	f, err := os.Open(abs)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil
+	}
+	defer gr.Close()
+	if gr.Name != "mosdns_cache_v2" {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	var header [8]byte
+	for {
+		if _, err := io.ReadFull(gr, header[:]); err != nil {
+			break
+		}
+		length := binary.BigEndian.Uint64(header[:])
+		if length == 0 {
+			continue
+		}
+		if length > 1<<20 {
+			break
+		}
+		block := make([]byte, int(length))
+		if _, err := io.ReadFull(gr, block); err != nil {
+			break
+		}
+		for _, match := range cacheDomainRE.FindAll(block, -1) {
+			domain := normalizeCacheDomainCandidate(string(match))
+			if domain == "" || seen[domain] {
+				continue
+			}
+			seen[domain] = true
+			out = append(out, domain)
+			if limit > 0 && len(out) >= limit {
+				sort.Strings(out)
+				return out
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func normalizeCacheDomainCandidate(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.Trim(value, `"'[]{}(),;`)
+	value = strings.TrimSuffix(value, ".")
+	value = strings.TrimPrefix(value, "*.")
+	if value == "" || strings.Contains(value, "..") || strings.Contains(value, "_") {
+		return ""
+	}
+	if strings.HasPrefix(value, "in-addr.") || strings.HasSuffix(value, ".arpa") {
+		return ""
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	for _, part := range parts {
+		if part == "" || len(part) > 63 {
+			return ""
+		}
+	}
+	return value
+}
+
+func dateOnly(value string) string {
+	if value == "" {
+		return ""
+	}
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t.Format("2006-01-02")
+	}
+	if len(value) >= 10 {
+		return strings.ReplaceAll(value[:10], "/", "-")
+	}
+	return ""
+}
+
+func countMosDNSCacheDumpBlockEntries(block []byte) int {
+	var count int
+	for i := 0; i < len(block); {
+		tag, n := readProtoVarint(block[i:])
+		if n <= 0 {
+			break
+		}
+		i += n
+		field := tag >> 3
+		wire := tag & 7
+		switch wire {
+		case 0:
+			_, n = readProtoVarint(block[i:])
+			if n <= 0 {
+				return count
+			}
+			i += n
+		case 1:
+			i += 8
+		case 2:
+			length, n := readProtoVarint(block[i:])
+			if n <= 0 {
+				return count
+			}
+			i += n
+			if length > uint64(len(block)-i) {
+				return count
+			}
+			if field == 1 {
+				count++
+			}
+			i += int(length)
+		case 5:
+			i += 4
+		default:
+			return count
+		}
+		if i < 0 || i > len(block) {
+			return count
+		}
+	}
+	return count
+}
+
+func readProtoVarint(data []byte) (uint64, int) {
+	var value uint64
+	for i, b := range data {
+		if i == 10 {
+			return 0, -1
+		}
+		value |= uint64(b&0x7f) << (uint(i) * 7)
+		if b < 0x80 {
+			return value, i + 1
+		}
+	}
+	return 0, 0
+}
+
 func normalizeMapPayload(raw any) map[string]any {
 	switch v := raw.(type) {
 	case map[string]any:
@@ -253,6 +817,83 @@ func (a *App) mosDNSClientIPSet() map[string]bool {
 		}
 	}
 	return out
+}
+
+func normalizeMosDNSClientProxyMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "white", "whitelist", "allow", "allowlist":
+		return "white"
+	case "black", "blacklist", "deny", "denylist", "block", "proxy", "proxy_default":
+		return "black"
+	default:
+		return "off"
+	}
+}
+
+func (a *App) mosDNSClientProxyMode() string {
+	switches := a.mosDNSSwitchMap()
+	switch {
+	case switches["switch2"] && !switches["switch12"]:
+		return "white"
+	case !switches["switch2"] && switches["switch12"]:
+		return "black"
+	case !switches["switch2"] && !switches["switch12"]:
+		return "off"
+	default:
+		return normalizeMosDNSClientProxyMode(a.setting("mosdns_client_proxy_mode", "off"))
+	}
+}
+
+func (a *App) setMosDNSClientProxyMode(mode string) error {
+	mode = normalizeMosDNSClientProxyMode(mode)
+	now := time.Now()
+	states := map[string]bool{
+		"switch2":  mode == "white",
+		"switch12": mode == "black",
+	}
+	for key, enabled := range states {
+		_, _ = a.DB.Exec(`insert into mosdns_switch_states(switch_key,enabled,created_at,updated_at) values(?,?,?,?) on conflict(switch_key) do update set enabled=excluded.enabled,updated_at=excluded.updated_at`, key, enabled, now, now)
+	}
+	a.setSetting("mosdns_client_proxy_mode", mode)
+	if err := a.rewriteMosDNSSwitchFile(); err != nil {
+		return err
+	}
+	return a.applyMosDNSClientActiveStatus()
+}
+
+func (a *App) clientListStatusForCurrentMode() string {
+	switch a.mosDNSClientProxyMode() {
+	case "black":
+		return "deny"
+	case "white":
+		return "allow"
+	default:
+		return "unscanned"
+	}
+}
+
+func (a *App) applyMosDNSClientActiveStatus() error {
+	now := time.Now()
+	status := a.clientListStatusForCurrentMode()
+	_, _ = a.DB.Exec(`update mosdns_clients set type='unscanned',updated_at=? where type in ('allow','deny')`, now)
+	if status == "unscanned" {
+		return nil
+	}
+	_, err := a.DB.Exec(`update mosdns_clients set type=?,updated_at=? where ip in (select ip from mosdns_client_ips)`, status, now)
+	return err
+}
+
+func (a *App) syncMosDNSClientListed(idOrKey, status string) error {
+	var ip, name string
+	err := a.DB.QueryRow(`select ip,coalesce(custom_name,hostname,'') from mosdns_clients where id=? or ip=? or mac=? order by id desc limit 1`, idOrKey, idOrKey, idOrKey).Scan(&ip, &name)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		return err
+	}
+	listed := status == "allow" || status == "deny"
+	return a.setMosDNSClientIPAllowed(ip, listed, name)
 }
 
 func normalizeMosDNSClientStatus(status string, allowListed bool) string {
@@ -359,11 +1000,19 @@ func structuredLogLines(lines []string) []map[string]any {
 			out = append(out, entry)
 			continue
 		}
+		if entry, ok := structuredLogfmtLine(line); ok {
+			out = append(out, entry)
+			continue
+		}
+		timestamp, message := splitLeadingLogTime(line)
+		if message == "" {
+			message = strings.TrimSpace(line)
+		}
 		out = append(out, map[string]any{
-			"time":    firstLogTime(line),
+			"time":    timestamp,
 			"level":   logLevelFromLine(line),
-			"message": line,
-			"display": line,
+			"message": message,
+			"display": message,
 			"raw":     line,
 		})
 	}
@@ -412,9 +1061,52 @@ func structuredJSONLogLine(line string) (map[string]any, bool) {
 	}, true
 }
 
+func structuredLogfmtLine(line string) (map[string]any, bool) {
+	line = strings.TrimSpace(line)
+	if !strings.Contains(line, "=") {
+		return nil, false
+	}
+	fields := map[string]string{}
+	for _, match := range logfmtFieldRE.FindAllStringSubmatch(line, -1) {
+		if len(match) < 3 {
+			continue
+		}
+		value := match[2]
+		if strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) {
+			if unquoted, err := strconv.Unquote(value); err == nil {
+				value = unquoted
+			} else {
+				value = strings.Trim(value, `"`)
+			}
+		}
+		fields[match[1]] = value
+	}
+	if fields["time"] == "" && fields["level"] == "" && fields["msg"] == "" && fields["message"] == "" {
+		return nil, false
+	}
+	message := firstNonEmpty(fields["msg"], fields["message"], fields["error"])
+	if message == "" {
+		message = line
+	}
+	return map[string]any{
+		"time":    normalizeLogTime(fields["time"]),
+		"level":   strings.ToLower(firstNonEmpty(fields["level"], "info")),
+		"message": message,
+		"display": message,
+		"raw":     line,
+	}, true
+}
+
 func displayLogLine(line string) string {
 	if entry, ok := structuredJSONLogLine(line); ok {
 		return fmtAny(entry["display"])
+	}
+	if entry, ok := structuredLogfmtLine(line); ok {
+		return fmtAny(entry["display"])
+	}
+	_, message := splitLeadingLogTime(line)
+	if message != "" {
+		return message
 	}
 	return line
 }
@@ -442,6 +1134,9 @@ func logLevelFromLine(line string) string {
 	if entry, ok := structuredJSONLogLine(line); ok {
 		return fmtAny(entry["level"])
 	}
+	if entry, ok := structuredLogfmtLine(line); ok {
+		return fmtAny(entry["level"])
+	}
 	lower := strings.ToLower(line)
 	switch {
 	case strings.Contains(lower, "panic") || strings.Contains(lower, "fatal"):
@@ -461,6 +1156,12 @@ func firstLogTime(line string) string {
 	if entry, ok := structuredJSONLogLine(line); ok {
 		return fmtAny(entry["time"])
 	}
+	if entry, ok := structuredLogfmtLine(line); ok {
+		return fmtAny(entry["time"])
+	}
+	if timestamp, _ := splitLeadingLogTime(line); timestamp != "" {
+		return timestamp
+	}
 	fields := strings.Fields(line)
 	for _, field := range fields {
 		field = strings.Trim(field, "[]")
@@ -472,6 +1173,34 @@ func firstLogTime(line string) string {
 		}
 	}
 	return ""
+}
+
+func splitLeadingLogTime(line string) (string, string) {
+	line = strings.TrimSpace(line)
+	if match := leadingRFC3339TimeRE.FindStringSubmatch(line); match != nil {
+		rest := ""
+		if len(match) > 2 {
+			rest = strings.TrimSpace(match[2])
+		}
+		return normalizeLogTime(match[1]), rest
+	}
+	if match := leadingDateTimeRE.FindStringSubmatch(line); match != nil {
+		rest := ""
+		if len(match) > 3 {
+			rest = strings.TrimSpace(match[3])
+		}
+		return strings.ReplaceAll(match[1], "/", "-") + " " + match[2], rest
+	}
+	return "", ""
+}
+
+func normalizeLogTime(value string) string {
+	value = strings.TrimSpace(strings.Trim(value, "[]"))
+	if value == "" {
+		return ""
+	}
+	value = strings.ReplaceAll(value, "/", "-")
+	return value
 }
 
 func (a *App) mosDNSRoutingState() map[string]any {
