@@ -38,6 +38,7 @@ func (a *App) scanMosDNSClientSources(iface string) ([]map[string]string, map[st
 		if c.Source == "" {
 			c.Source = "scan"
 		}
+		c.Source = normalizeMosDNSClientSource(c.Source)
 		current, ok := clients[c.IP]
 		if !ok {
 			clients[c.IP] = c
@@ -72,7 +73,7 @@ func (a *App) scanMosDNSClientSources(iface string) ([]map[string]string, map[st
 		add(discoveredMosDNSClient{IP: ip, Source: "allowlist", Online: false})
 	}
 	for _, entry := range a.mosDNSQueryDataset(2000) {
-		add(discoveredMosDNSClient{IP: stringMapValue(entry, "client_ip"), Hostname: stringMapValue(entry, "client"), Source: "dnslog", Online: false})
+		add(discoveredMosDNSClient{IP: stringMapValue(entry, "client_ip"), Hostname: stringMapValue(entry, "client"), Source: "mosdns", Online: false})
 	}
 	out := make([]map[string]string, 0, len(clients))
 	for _, c := range clients {
@@ -113,6 +114,7 @@ func (a *App) upsertMosDNSScannedClient(item map[string]string, allowIPs map[str
 	hostname := strings.TrimSpace(item["hostname"])
 	iface := strings.TrimSpace(item["interface"])
 	source := firstNonEmpty(strings.TrimSpace(item["source"]), "scan")
+	source = normalizeMosDNSClientSource(source)
 	online := strings.EqualFold(item["online"], "true") || source == "neigh" || strings.Contains(source, "arp")
 	status := "unscanned"
 	listStatus := a.clientListStatusForCurrentMode()
@@ -215,6 +217,30 @@ func scanProcNetARP(iface string) []discoveredMosDNSClient {
 		out = append(out, discoveredMosDNSClient{IP: fields[0], MAC: fields[3], Interface: fields[5], Source: "proc_arp", Online: true})
 	}
 	return out
+}
+
+func normalizeMosDNSClientSource(source string) string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, part := range strings.Split(source, ",") {
+		item := strings.ToLower(strings.TrimSpace(part))
+		switch item {
+		case "ip", "ip_neigh", "neigh", "arp", "proc_arp":
+			item = "arp"
+		case "dnslog", "dns_log", "querylog", "query_log", "query", "mosdns":
+			item = "mosdns"
+		case "":
+			continue
+		}
+		if !seen[item] {
+			seen[item] = true
+			out = append(out, item)
+		}
+	}
+	if len(out) == 0 {
+		return "scan"
+	}
+	return strings.Join(out, ",")
 }
 
 func refreshNeighborCache(iface string) {

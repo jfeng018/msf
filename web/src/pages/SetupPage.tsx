@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import {
+  AlertCircle,
   ArrowLeft,
   ArrowRight,
   Check,
@@ -15,6 +16,7 @@ import {
   Mail,
   Network,
   Plus,
+  RefreshCw,
   Rocket,
   Server,
   Settings2,
@@ -97,6 +99,24 @@ const defaultForm = {
 
 type SetupForm = typeof defaultForm;
 
+type SetupDownloadStatus = "pending" | "running" | "completed" | "failed" | "skipped";
+type SetupDownloadIntroStage = 0 | 1 | 2;
+
+interface SetupDownloadStep {
+  component: string;
+  title: string;
+  description: string;
+  status: SetupDownloadStatus;
+  progress: number;
+  message: string;
+}
+
+interface SetupDownloadEvent {
+  status?: string;
+  progress?: number;
+  message?: string;
+}
+
 const steps = [
   { title: "欢迎", description: "开始配置", icon: Rocket },
   { title: "管理员", description: "创建账户", icon: UserRound },
@@ -108,6 +128,73 @@ const steps = [
 
 const inputClass =
   "h-10 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/15 disabled:cursor-not-allowed disabled:opacity-60";
+
+const downloadComponentMeta: Record<string, { title: string; description: string }> = {
+  mosdns: { title: "MosDNS", description: "下载并安装 DNS 分流核心" },
+  mihomo: { title: "Mihomo", description: "下载代理核心并安装控制面板" },
+  __activate: { title: "启动服务", description: "启动 MosDNS 与代理核心服务" },
+};
+
+function normalizeDownloadComponents(value: unknown, form?: SetupForm) {
+  const raw = Array.isArray(value) ? value : typeof value === "string" && value ? [value] : [];
+  const out: string[] = [];
+  const add = (item: unknown) => {
+    const component = String(item || "").trim().toLowerCase();
+    if (!component || component === "singbox" || component === "sing-box") return;
+    const normalized = component === "zashboard" || component === "ui" ? "mihomo" : component;
+    if ((normalized === "mosdns" || normalized === "mihomo") && !out.includes(normalized)) out.push(normalized);
+  };
+  raw.forEach(add);
+  if (out.length === 0 && form) {
+    if (form.mosdnsEnabled) add("mosdns");
+    if (form.proxyCore === "mihomo") add("mihomo");
+  }
+  return out;
+}
+
+function createDownloadSteps(components: string[]): SetupDownloadStep[] {
+  return components.map((component) => {
+    const meta = downloadComponentMeta[component] || { title: component, description: "下载并安装组件" };
+    return {
+      component,
+      title: meta.title,
+      description: meta.description,
+      status: "pending",
+      progress: 0,
+      message: "等待下载",
+    };
+  });
+}
+
+function streamSetupDownload(component: string, onEvent: (event: SetupDownloadEvent) => void) {
+  return new Promise<void>((resolve, reject) => {
+    const source = new EventSource(`/api/v1/setup/download/${encodeURIComponent(component)}?skip_if_exists=1`);
+    let settled = false;
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      source.close();
+      if (err) reject(err);
+      else resolve();
+    };
+    source.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data) as SetupDownloadEvent;
+        onEvent(payload);
+        const status = String(payload.status || "").toLowerCase();
+        if (status === "completed" || status === "skipped") finish();
+        if (status === "failed") finish(new Error(payload.message || `${component} 下载失败`));
+      } catch (err) {
+        finish(err instanceof Error ? err : new Error(String(err)));
+      }
+    };
+    source.onerror = () => finish(new Error(`${downloadComponentMeta[component]?.title || component} 下载连接中断`));
+  });
+}
+
+function wait(ms: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+}
 
 function networkRows(payload: any): NetworkInterface[] {
   if (Array.isArray(payload)) return payload;
@@ -462,12 +549,226 @@ function Badge({ children, tone = "muted" }: { children: ReactNode; tone?: "mute
   );
 }
 
+function SetupDownloadView({
+  steps: downloadSteps,
+  introStage,
+  status,
+  error,
+  failedComponent,
+  busy,
+  onRetry,
+  onManual,
+}: {
+  steps: SetupDownloadStep[];
+  introStage: SetupDownloadIntroStage;
+  status: "running" | "completed" | "failed";
+  error: string;
+  failedComponent: string;
+  busy: boolean;
+  onRetry: () => void;
+  onManual: () => void;
+}) {
+  type VisualStep = {
+    key: string;
+    title: string;
+    message?: string;
+    status: SetupDownloadStatus;
+    progress?: number;
+    icon: LucideIcon;
+  };
+
+  const introComplete = introStage >= 2;
+  const visibleDownloadSteps = introComplete
+    ? downloadSteps
+    : downloadSteps.map((item) => ({ ...item, status: "pending" as SetupDownloadStatus, progress: 0, message: "" }));
+  const downloadsDone =
+    introComplete && visibleDownloadSteps.every((item) => item.status === "completed" || item.status === "skipped");
+  const visualSteps: VisualStep[] = [
+    {
+      key: "account",
+      title: "创建管理员账户",
+      message: introStage === 0 ? "正在保存管理员账户" : "",
+      status: introStage === 0 ? "running" : "completed",
+      icon: UserRound,
+    },
+    {
+      key: "system",
+      title: "配置系统设置",
+      message: introStage === 1 ? "正在写入基础配置" : "",
+      status: introStage === 0 ? "pending" : introStage === 1 ? "running" : "completed",
+      icon: Settings2,
+    },
+    ...visibleDownloadSteps.map((item) => ({
+      key: item.component,
+      title: `下载 ${item.title}`,
+      message: item.status === "pending" ? "" : item.message,
+      status: item.status,
+      progress: item.progress,
+      icon: DownloadCloud,
+    })),
+    {
+      key: "__activate",
+      title: "启动服务",
+      message: failedComponent === "__activate" ? error : "",
+      status:
+        failedComponent === "__activate"
+          ? "failed"
+          : status === "completed"
+            ? "completed"
+            : downloadsDone && status === "running"
+              ? "running"
+              : "pending",
+      icon: Globe2,
+    },
+    {
+      key: "__finalize",
+      title: "完成初始化配置",
+      message: failedComponent === "__finalize" ? error : "",
+      status: failedComponent === "__finalize" ? "failed" : status === "completed" ? "completed" : "pending",
+      icon: ShieldCheck,
+    },
+  ];
+  const completed = visualSteps.filter((item) => item.status === "completed" || item.status === "skipped").length;
+  const overall = Math.round((completed / Math.max(visualSteps.length, 1)) * 100);
+  const failedTitle = downloadComponentMeta[failedComponent]?.title || failedComponent || "-";
+
+  return (
+    <div className="fixed inset-0 z-50 flex min-h-screen items-center justify-center bg-background/95 px-4 py-10 text-foreground backdrop-blur-sm">
+      <div className="w-full max-w-md">
+        <div className="mb-8 text-center">
+          <div className="mb-4 flex justify-center">
+            <div className="relative">
+              <div className="absolute inset-0 rounded-full bg-primary/20 blur-xl" />
+              <img src="/logo/logo-square.svg" alt="MSM" className="relative z-10 h-16 w-16" />
+            </div>
+          </div>
+          <h2 className="mb-2 text-2xl font-bold tracking-normal text-foreground">
+            {status === "failed" ? "初始化失败" : "正在初始化系统"}
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            {status === "failed" ? "核心组件未安装完成，请重试或稍后手动下载。" : "请稍候,我们正在为您配置 MSM 管理平台..."}
+          </p>
+        </div>
+
+        <div className="mb-8 space-y-3">
+          {visualSteps.map((item) => {
+            const Icon = item.icon;
+            const isCompleted = item.status === "completed" || item.status === "skipped";
+            const isRunning = item.status === "running";
+            const isFailed = item.status === "failed";
+            const isPending = item.status === "pending";
+
+            return (
+              <div
+                key={item.key}
+                className={cn(
+                  "flex items-start gap-3 rounded-lg p-3 transition-all duration-300",
+                  isRunning && "border border-primary/20 bg-primary/10",
+                  isCompleted && "bg-muted/50",
+                  isFailed && "border border-red-500/20 bg-red-500/10",
+                  isPending && "opacity-40"
+                )}
+              >
+                <span
+                  className={cn(
+                    "flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-all duration-300",
+                    isCompleted && "bg-green-500 text-white",
+                    isRunning && "bg-primary text-primary-foreground",
+                    isFailed && "bg-red-500 text-white",
+                    isPending && "bg-muted text-muted-foreground"
+                  )}
+                >
+                  {isCompleted ? (
+                    <Check className="h-4 w-4" />
+                  ) : isRunning ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : isFailed ? (
+                    <AlertCircle className="h-4 w-4" />
+                  ) : (
+                    <Icon className="h-4 w-4" />
+                  )}
+                </span>
+
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <p
+                      className={cn(
+                        "text-sm font-medium transition-colors",
+                        isRunning && "text-foreground",
+                        isCompleted && "text-muted-foreground",
+                        isFailed && "text-red-500",
+                        isPending && "text-muted-foreground"
+                      )}
+                    >
+                      {item.title}
+                    </p>
+                    {isFailed && <Badge tone="warning">失败</Badge>}
+                  </div>
+
+                  {item.message && (
+                    <p className="mt-1 truncate text-xs text-muted-foreground">
+                      {item.key === "__activate" || item.key === "__finalize" ? item.message : `${item.title.replace(/^下载\s+/, "")}: ${item.message}`}
+                    </p>
+                  )}
+
+                  {item.key !== "__activate" && item.key !== "__finalize" && (isRunning || isFailed) && item.progress !== undefined && (
+                    <div className="mt-2 h-1 overflow-hidden rounded-full bg-muted">
+                      <div
+                        className={cn("h-full rounded-full transition-all duration-300", isFailed ? "bg-red-500" : "bg-primary")}
+                        style={{ width: `${Math.max(0, Math.min(100, item.progress || 0))}%` }}
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {isCompleted && <Check className="mt-1 h-5 w-5 shrink-0 text-green-500" />}
+              </div>
+            );
+          })}
+        </div>
+
+        {status === "failed" && (
+          <div className="mb-5 rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-sm leading-6 text-red-700 dark:text-red-300">
+            <div className="font-medium">失败组件：{failedTitle}</div>
+            <div className="mt-1 break-words">{error || "下载失败，请检查网络或 GitHub 加速配置。"}</div>
+            <div className="mt-1 text-muted-foreground">也可以登录后进入系统设置页面，在组件更新里手动下载。</div>
+          </div>
+        )}
+
+        <div className="h-2 overflow-hidden rounded-full bg-muted">
+          <div className="h-full rounded-full bg-primary transition-all duration-300" style={{ width: `${overall}%` }} />
+        </div>
+        <p className="mt-5 text-center text-xs text-muted-foreground">
+          {status === "failed" ? "处理失败后可重试，或登录后到系统设置中手动下载组件" : "初始化完成后将自动跳转到登录页面"}
+        </p>
+
+        {status === "failed" && (
+          <div className="mt-5 flex flex-wrap justify-center gap-3">
+            <SetupPageButton disabled={busy} onClick={onManual}>
+              登录后去系统设置手动下载
+            </SetupPageButton>
+            <SetupPageButton variant="primary" disabled={busy} onClick={onRetry}>
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              重试下载
+            </SetupPageButton>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function SetupPage() {
   const navigate = useNavigate();
-  const { initialized, user, loading, refresh } = useAuth();
+  const { initialized, user, loading, refresh, setupNeedsRecovery, setupDownloadComponents } = useAuth();
   const [step, setStep] = useState(0);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [downloadStatus, setDownloadStatus] = useState<"idle" | "running" | "completed" | "failed">("idle");
+  const [downloadIntroStage, setDownloadIntroStage] = useState<SetupDownloadIntroStage>(2);
+  const [downloadSteps, setDownloadSteps] = useState<SetupDownloadStep[]>([]);
+  const [downloadError, setDownloadError] = useState("");
+  const [failedComponent, setFailedComponent] = useState("");
   const [system, setSystem] = useState<SetupSystemInfo | null>(null);
   const [privilege, setPrivilege] = useState<PrivilegeInfo | null>(null);
   const [ifaces, setIfaces] = useState<NetworkInterface[]>([]);
@@ -477,10 +778,21 @@ export function SetupPage() {
   const [nodeMode, setNodeMode] = useState<"share" | "yaml">("share");
 
   useEffect(() => {
-    if (!loading && initialized) {
+    if (!loading && initialized && !setupNeedsRecovery) {
       navigate(user ? "/" : "/login", { replace: true });
     }
-  }, [loading, initialized, user, navigate]);
+  }, [loading, initialized, setupNeedsRecovery, user, navigate]);
+
+  useEffect(() => {
+    if (loading || !initialized || !setupNeedsRecovery || downloadStatus !== "idle") return;
+    const components = normalizeDownloadComponents(setupDownloadComponents, form);
+    setStep(steps.length - 1);
+    setDownloadIntroStage(2);
+    setDownloadSteps(createDownloadSteps(components));
+    setDownloadStatus("failed");
+    setDownloadError("核心组件尚未安装完成。您可以重试下载，或登录后到系统设置的组件更新页手动下载。");
+    setFailedComponent(components[0] || "");
+  }, [downloadStatus, form, initialized, loading, setupDownloadComponents, setupNeedsRecovery]);
 
   useEffect(() => {
     Promise.allSettled([
@@ -548,6 +860,84 @@ export function SetupPage() {
     return errors;
   };
 
+  const activateAndGoLogin = async () => {
+    await api("/api/v1/setup/activate", { method: "POST", skipAuth: true });
+    await refresh();
+    navigate("/login", { replace: true });
+  };
+
+  const runDownloadFlow = async (componentsValue: unknown) => {
+    const components = normalizeDownloadComponents(componentsValue, form);
+    if (components.length === 0) {
+      await activateAndGoLogin();
+      return;
+    }
+    setDownloadIntroStage(0);
+    setDownloadSteps(createDownloadSteps(components));
+    setDownloadStatus("running");
+    setDownloadError("");
+    setFailedComponent("");
+    await wait(340);
+    setDownloadIntroStage(1);
+    await wait(340);
+    setDownloadIntroStage(2);
+    await wait(120);
+    for (const component of components) {
+      setDownloadSteps((items) =>
+        items.map((item) =>
+          item.component === component
+            ? { ...item, status: "running", progress: Math.max(item.progress, 1), message: "正在连接下载服务" }
+            : item
+        )
+      );
+      try {
+        await streamSetupDownload(component, (event) => {
+          const eventStatus = String(event.status || "running").toLowerCase();
+          const status: SetupDownloadStatus =
+            eventStatus === "completed" || eventStatus === "skipped" || eventStatus === "failed"
+              ? (eventStatus as SetupDownloadStatus)
+              : "running";
+          setDownloadSteps((items) =>
+            items.map((item) =>
+              item.component === component
+                ? {
+                    ...item,
+                    status,
+                    progress: Math.max(0, Math.min(100, Number(event.progress ?? item.progress ?? 0))),
+                    message: event.message || item.message,
+                  }
+                : item
+            )
+          );
+        });
+        setDownloadSteps((items) =>
+          items.map((item) =>
+            item.component === component ? { ...item, status: item.status === "skipped" ? "skipped" : "completed", progress: 100 } : item
+          )
+        );
+      } catch (err) {
+        const msg = errorMessage(err);
+        setFailedComponent(component);
+        setDownloadError(msg);
+        setDownloadStatus("failed");
+        setDownloadSteps((items) =>
+          items.map((item) =>
+            item.component === component ? { ...item, status: "failed", message: msg, progress: Math.max(item.progress, 1) } : item
+          )
+        );
+        return;
+      }
+    }
+    setDownloadStatus("completed");
+    try {
+      await activateAndGoLogin();
+    } catch (err) {
+      setFailedComponent("__activate");
+      setDownloadError(`核心组件已下载，但服务启动失败：${errorMessage(err)}`);
+      setDownloadStatus("failed");
+    }
+  };
+
   const completeInitialize = async () => {
     const errors = validateAll();
     if (errors.length > 0) {
@@ -558,7 +948,7 @@ export function SetupPage() {
     setBusy(true);
     setMessage("");
     try {
-      await api("/api/v1/setup/initialize", {
+      const payload = await api<any>("/api/v1/setup/initialize", {
         method: "POST",
         body: JSON.stringify({
           ...form,
@@ -567,11 +957,31 @@ export function SetupPage() {
         }),
         skipAuth: true,
       });
-      await api("/api/v1/setup/activate", { method: "POST", skipAuth: true }).catch(() => null);
-      await refresh();
-      navigate("/login", { replace: true });
+      setBusy(false);
+      await runDownloadFlow(payload?.download_component);
     } catch (err) {
       setMessage(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const retryDownloads = async () => {
+    setBusy(true);
+    try {
+      const components = downloadSteps.length > 0 ? downloadSteps.map((item) => item.component) : setupDownloadComponents;
+      await runDownloadFlow(components);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const goManualDownload = async () => {
+    setBusy(true);
+    try {
+      await api("/api/v1/setup/activate", { method: "POST", skipAuth: true }).catch(() => null);
+      await refresh().catch(() => undefined);
+      navigate(`/login?redirect=${encodeURIComponent("/settings?tab=update")}`, { replace: true });
     } finally {
       setBusy(false);
     }
@@ -601,6 +1011,21 @@ export function SetupPage() {
       )}
     </>
   );
+
+  if (downloadStatus !== "idle") {
+    return (
+      <SetupDownloadView
+        steps={downloadSteps}
+        introStage={downloadIntroStage}
+        status={downloadStatus}
+        error={downloadError}
+        failedComponent={failedComponent}
+        busy={busy}
+        onRetry={() => void retryDownloads()}
+        onManual={() => void goManualDownload()}
+      />
+    );
+  }
 
   return (
     <div className="min-h-screen bg-background text-foreground">

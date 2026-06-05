@@ -1,51 +1,27 @@
 "use client";
 
-import { useMemo, type CSSProperties } from "react";
+import { useEffect, useRef, type CSSProperties } from "react";
+import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
+import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
+import { yaml } from "@codemirror/lang-yaml";
+import { bracketMatching, defaultHighlightStyle, foldGutter, indentOnInput, syntaxHighlighting } from "@codemirror/language";
+import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
+import { EditorState } from "@codemirror/state";
+import {
+  drawSelection,
+  dropCursor,
+  EditorView,
+  highlightActiveLine,
+  highlightActiveLineGutter,
+  keymap,
+  lineNumbers,
+} from "@codemirror/view";
+import { oneDark } from "@codemirror/theme-one-dark";
 
-/* VS Code Dark+ token palette (matches the original CodeMirror theme) */
-const COLORS = {
-  comment: "#6A9955",
-  key: "#9CDCFE",
-  anchor: "#4FC1FF",
-  string: "#CE9178",
-  number: "#B5CEA8",
-  keyword: "#569CD6",
-  punct: "#D4D4D4",
-  text: "#D4D4D4",
-};
-
-type Tok = { t: string; c: keyof typeof COLORS };
-
-/* Lightweight YAML tokenizer — good enough to mirror VS Code Dark+ colors */
-function tokenizeLine(line: string): Tok[] {
-  if (line.trimStart().startsWith("#")) return [{ t: line, c: "comment" }];
-
-  const toks: Tok[] = [];
-  const re =
-    /('[^']*'|"[^"]*")|(\s#.*$)|(&[\w.-]+|\*[\w.-]+)|\b(true|false|null|yes|no)\b|(-?\b\d+(?:\.\d+)?\b)|([A-Za-z_][\w.-]*)(?=\s*:)|([:{}\[\],|>-])/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(line)) !== null) {
-    if (m.index > last) toks.push({ t: line.slice(last, m.index), c: "text" });
-    if (m[1]) toks.push({ t: m[1], c: "string" });
-    else if (m[2]) toks.push({ t: m[2], c: "comment" });
-    else if (m[3]) toks.push({ t: m[3], c: "anchor" });
-    else if (m[4]) toks.push({ t: m[4], c: "keyword" });
-    else if (m[5]) toks.push({ t: m[5], c: "number" });
-    else if (m[6]) toks.push({ t: m[6], c: "key" });
-    else if (m[7]) toks.push({ t: m[7], c: "punct" });
-    last = re.lastIndex;
-  }
-  if (last < line.length) toks.push({ t: line.slice(last), c: "text" });
-  return toks;
+function maxHeightValue(value: CSSProperties["maxHeight"]) {
+  if (typeof value === "number") return `${value}px`;
+  return value == null ? "460px" : String(value);
 }
-
-const FONT: CSSProperties = {
-  fontFamily: 'Menlo, Monaco, Consolas, "Andale Mono", "Ubuntu Mono", monospace',
-  fontSize: "13px",
-  lineHeight: "20px",
-  tabSize: 2,
-};
 
 export function YamlEditor({
   value,
@@ -58,51 +34,129 @@ export function YamlEditor({
   maxHeight?: CSSProperties["maxHeight"];
   className?: string;
 }) {
-  const lines = useMemo(() => value.split("\n"), [value]);
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const viewRef = useRef<EditorView | null>(null);
+  const onChangeRef = useRef(onChange);
+  const syncingRef = useRef(false);
+  const height = maxHeightValue(maxHeight);
+
+  useEffect(() => {
+    onChangeRef.current = onChange;
+  }, [onChange]);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+
+    const view = new EditorView({
+      parent: host,
+      state: EditorState.create({
+        doc: value,
+        extensions: [
+          lineNumbers(),
+          foldGutter(),
+          highlightActiveLineGutter(),
+          history(),
+          drawSelection(),
+          dropCursor(),
+          indentOnInput(),
+          bracketMatching(),
+          closeBrackets(),
+          autocompletion(),
+          highlightSelectionMatches(),
+          yaml(),
+          syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+          oneDark,
+          keymap.of([
+            indentWithTab,
+            ...closeBracketsKeymap,
+            ...defaultKeymap,
+            ...historyKeymap,
+            ...searchKeymap,
+            ...completionKeymap,
+          ]),
+          EditorView.lineWrapping,
+          EditorView.updateListener.of((update) => {
+            if (update.docChanged && !syncingRef.current) onChangeRef.current(update.state.doc.toString());
+          }),
+          EditorView.theme({
+            "&": {
+              height: "100%",
+              backgroundColor: "#1e1e1e",
+              color: "#d4d4d4",
+            },
+            ".cm-scroller": {
+              maxHeight: height,
+              overflow: "auto",
+              fontFamily: 'Menlo, Monaco, Consolas, "Andale Mono", "Ubuntu Mono", monospace',
+              fontSize: "13px",
+              lineHeight: "20px",
+            },
+            ".cm-content": {
+              minHeight: "180px",
+              padding: "12px 16px 12px 0",
+              caretColor: "#ffffff",
+            },
+            ".cm-line": {
+              padding: "0 8px",
+            },
+            ".cm-gutters": {
+              backgroundColor: "#1e1e1e",
+              color: "#858585",
+              borderRight: "1px solid rgba(255,255,255,0.08)",
+            },
+            ".cm-activeLineGutter": {
+              backgroundColor: "rgba(255,255,255,0.06)",
+            },
+            ".cm-activeLine": {
+              backgroundColor: "rgba(255,255,255,0.045)",
+            },
+            ".cm-selectionBackground, &.cm-focused .cm-selectionBackground": {
+              backgroundColor: "rgba(38, 121, 255, 0.45)",
+            },
+            "&.cm-focused": {
+              outline: "none",
+            },
+            ".cm-search": {
+              backgroundColor: "#252526",
+              color: "#d4d4d4",
+              borderTop: "1px solid rgba(255,255,255,0.12)",
+            },
+            ".cm-search input": {
+              backgroundColor: "#1e1e1e",
+              color: "#d4d4d4",
+              border: "1px solid rgba(255,255,255,0.18)",
+              borderRadius: "6px",
+            },
+          }, { dark: true }),
+        ],
+      }),
+    });
+
+    viewRef.current = view;
+    return () => {
+      view.destroy();
+      if (viewRef.current === view) viewRef.current = null;
+    };
+  }, [height]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const current = view.state.doc.toString();
+    if (current === value) return;
+    syncingRef.current = true;
+    view.dispatch({
+      changes: { from: 0, to: current.length, insert: value },
+    });
+    syncingRef.current = false;
+  }, [value]);
 
   return (
     <div
-      className={`relative flex overflow-auto bg-[#1e1e1e] text-[#d4d4d4] ${className ?? ""}`}
+      className={`overflow-hidden bg-[#1e1e1e] text-[#d4d4d4] ${className ?? ""}`}
       style={{ maxHeight }}
-    >
-      {/* Gutter */}
-      <div
-        className="select-none text-right py-3 pl-3 pr-3 text-[#858585] shrink-0 sticky left-0 bg-[#1e1e1e] z-10"
-        style={FONT}
-        aria-hidden
-      >
-        {lines.map((_, i) => (
-          <div key={i}>{i + 1}</div>
-        ))}
-      </div>
-
-      {/* Code area: highlighted <pre> behind a transparent <textarea> */}
-      <div className="relative flex-1" style={{ minWidth: "max-content" }}>
-        <pre
-          className="m-0 py-3 pr-6 pointer-events-none whitespace-pre"
-          style={FONT}
-          aria-hidden
-        >
-          {lines.map((line, i) => (
-            <div key={i} style={{ minHeight: 20 }}>
-              {tokenizeLine(line).map((tok, j) => (
-                <span key={j} style={{ color: COLORS[tok.c] }}>
-                  {tok.t}
-                </span>
-              ))}
-              {line.length === 0 && "​"}
-            </div>
-          ))}
-        </pre>
-        <textarea
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          spellCheck={false}
-          wrap="off"
-          className="absolute inset-0 m-0 py-3 pr-6 bg-transparent text-transparent caret-white outline-none resize-none whitespace-pre overflow-hidden"
-          style={FONT}
-        />
-      </div>
-    </div>
+      ref={hostRef}
+    />
   );
 }

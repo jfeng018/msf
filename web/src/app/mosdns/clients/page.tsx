@@ -90,6 +90,27 @@ function statusBadge(status: ClientStatus) {
   }
 }
 
+function normalizeClientSource(source: unknown) {
+  const parts = stringValue(source)
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean)
+    .map((item) => {
+      if (["ip", "neigh", "ip_neigh", "proc_arp", "arp"].includes(item)) return "arp";
+      if (["dnslog", "dns_log", "querylog", "query_log", "mosdns"].includes(item)) return "mosdns";
+      return item;
+    });
+  return [...new Set(parts)].join(",");
+}
+
+function sourceBadge(source: string) {
+  const normalized = normalizeClientSource(source);
+  if (normalized === "mosdns") return { text: "mosdns", className: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300" };
+  if (normalized === "arp") return { text: "arp", className: "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300" };
+  if (normalized.includes("mosdns") && normalized.includes("arp")) return { text: "arp,mosdns", className: "bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-300" };
+  return { text: normalized || "scan", className: "bg-muted text-muted-foreground" };
+}
+
 function normalizeMode(raw: unknown): "off" | "white" | "black" {
   const mode = stringValue(raw).toLowerCase();
   if (mode.includes("allow") || mode.includes("white")) return "white";
@@ -109,7 +130,7 @@ function normalizeClient(row: any): Client {
     mac,
     name: name || "-",
     hostname,
-    source: stringValue(row.source || row.vendor || "runtime"),
+    source: normalizeClientSource(row.source || row.vendor || "runtime"),
     status: normalizeStatus(row.status || row.type || row.zone),
     queryCount: numberValue(row.query_count || row.queries),
     iface: stringValue(row.interface || row.iface),
@@ -147,7 +168,8 @@ function ClientCard({
   busy?: boolean;
 }) {
   const badge = statusBadge(client.status);
-  const badgeText = client.status === "unscanned" && client.source ? client.source : badge.text;
+  const source = sourceBadge(client.source);
+  const activeBadge = client.status === "unscanned" && client.source ? source : badge;
   const title = client.ip || client.name || client.hostname || "-";
   const detail = [
     client.ip,
@@ -176,8 +198,8 @@ function ClientCard({
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-1.5">
               <span className="font-semibold text-foreground text-sm leading-5 truncate" title={title}>{title}</span>
-              <span className={cn("text-[9px] px-1 py-0.5 rounded font-medium leading-3", badge.className)}>
-                {badgeText}
+              <span className={cn("text-[9px] px-1 py-0.5 rounded font-medium leading-3", activeBadge.className)}>
+                {activeBadge.text}
               </span>
             </div>
             <div className="text-[11px] leading-4 text-muted-foreground truncate">

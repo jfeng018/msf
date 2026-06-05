@@ -16,10 +16,23 @@ import (
 )
 
 func (a *App) handleSetupCheck(w http.ResponseWriter, r *http.Request) {
+	initialized := a.IsInitialized()
+	missing := []string{}
+	var existing map[string]any
+	if initialized {
+		if cfg, ok := a.latestSetupConfig(); ok {
+			cfg.defaults()
+			missing = a.setupMissingComponentsForConfig(cfg)
+			existing = setupConfigPayload(cfg, true)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"success":        true,
-		"is_initialized": a.IsInitialized(),
-		"needs_recovery": false,
+		"success":            true,
+		"is_initialized":     initialized,
+		"needs_recovery":     initialized && len(missing) > 0,
+		"needs_download":     len(missing) > 0,
+		"download_component": missing,
+		"existing_config":    existing,
 	})
 }
 
@@ -128,17 +141,7 @@ func (a *App) handleSetupPutConfig(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	missing := []string{}
-	for _, name := range managedServiceNames() {
-		if !a.Services.Status(name).Installed {
-			missing = append(missing, name)
-		}
-	}
-	if strings.EqualFold(cfg.ProxyCore, "mihomo") || cfg.ProxyCore == "" {
-		if _, err := os.Stat(a.componentTarget("zashboard")); err != nil {
-			missing = append(missing, "zashboard")
-		}
-	}
+	missing := a.setupMissingComponentsForConfig(cfg)
 	networkReapply := shouldRestoreNFT(cfg)
 	payload := setupConfigPayload(cfg, true)
 	response := map[string]any{
@@ -189,7 +192,13 @@ func (a *App) handleSetupInitialize(w http.ResponseWriter, r *http.Request) {
 	}
 	a.SetConfiguredRuntimeDesired(cfg)
 	a.audit(nil, "setup.initialize", "system", cfg.Username, true, "")
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "initialized"})
+	missing := a.setupMissingComponentsForConfig(cfg)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":            true,
+		"message":            "initialized",
+		"needs_download":     len(missing) > 0,
+		"download_component": missing,
+	})
 }
 
 func decodeSetupConfigRequest(r *http.Request, cfg *SetupConfig) error {
@@ -427,6 +436,20 @@ func (a *App) setupComponentInstalled(component string) bool {
 		}
 	}
 	return true
+}
+
+func (a *App) setupMissingComponentsForConfig(cfg SetupConfig) []string {
+	cfg.defaults()
+	missing := []string{}
+	if cfg.MosDNSEnabled && !a.setupComponentInstalled("mosdns") {
+		missing = append(missing, "mosdns")
+	}
+	if strings.EqualFold(cfg.ProxyCore, "mihomo") || cfg.ProxyCore == "" {
+		if !a.setupComponentInstalled("mihomo") {
+			missing = append(missing, "mihomo")
+		}
+	}
+	return missing
 }
 
 func (a *App) installSetupComponent(component string, emit func(DownloadEvent)) error {

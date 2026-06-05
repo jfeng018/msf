@@ -581,6 +581,52 @@ func TestSetupDownloadSkipIfExists(t *testing.T) {
 	}
 }
 
+func TestSetupCheckReportsRecoveryWhenConfiguredComponentsAreMissing(t *testing.T) {
+	app := newTestApp(t)
+
+	initial := requestJSON(t, app, http.MethodGet, "/api/v1/setup/check", "", nil)
+	if initial.Code != http.StatusOK || !strings.Contains(initial.Body.String(), `"is_initialized":false`) || !strings.Contains(initial.Body.String(), `"needs_recovery":false`) {
+		t.Fatalf("initial setup check mismatch: status=%d body=%s", initial.Code, initial.Body.String())
+	}
+
+	body := map[string]any{
+		"username":           "root",
+		"password":           "test-password-123",
+		"confirmPassword":    "test-password-123",
+		"webPort":            "17777",
+		"selected_interface": "eth0",
+		"proxyCore":          "mihomo",
+		"mosdnsEnabled":      true,
+	}
+	res := requestJSON(t, app, http.MethodPost, "/api/v1/setup/initialize", "", body)
+	if res.Code != http.StatusOK {
+		t.Fatalf("initialize status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	recovery := requestJSON(t, app, http.MethodGet, "/api/v1/setup/check", "", nil)
+	if recovery.Code != http.StatusOK ||
+		!strings.Contains(recovery.Body.String(), `"is_initialized":true`) ||
+		!strings.Contains(recovery.Body.String(), `"needs_recovery":true`) ||
+		!strings.Contains(recovery.Body.String(), `"mosdns"`) ||
+		!strings.Contains(recovery.Body.String(), `"mihomo"`) {
+		t.Fatalf("setup check should report missing components: status=%d body=%s", recovery.Code, recovery.Body.String())
+	}
+
+	for _, component := range []string{"mosdns", "mihomo", "zashboard"} {
+		target := app.componentTarget(component)
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte("ok"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ready := requestJSON(t, app, http.MethodGet, "/api/v1/setup/check", "", nil)
+	if ready.Code != http.StatusOK || !strings.Contains(ready.Body.String(), `"needs_recovery":false`) || !strings.Contains(ready.Body.String(), `"download_component":[]`) {
+		t.Fatalf("setup check should clear recovery when components exist: status=%d body=%s", ready.Code, ready.Body.String())
+	}
+}
+
 func TestLicenseStatusIsFreeUnlocked(t *testing.T) {
 	app := newTestApp(t)
 	res := requestJSON(t, app, http.MethodGet, "/api/v1/license-activation/status", "", nil)
@@ -748,6 +794,12 @@ func TestMosDNSClientScanMSMCompatShape(t *testing.T) {
 	app := newTestApp(t)
 	token := tokenForRole(t, app, "admin")
 	now := time.Now()
+	if err := os.MkdirAll(filepath.Join(app.DataDir, "logs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app.DataDir, "logs/mosdns.out.log"), []byte(`client_ip=192.168.10.60 query_name=client.example qtype=A rule=local rcode=NOERROR`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := app.DB.Exec(`insert into mosdns_client_ips(ip,comment,created_at,updated_at) values(?,?,?,?)`, "192.168.10.50", "unit", now, now); err != nil {
 		t.Fatal(err)
 	}
@@ -757,6 +809,9 @@ func TestMosDNSClientScanMSMCompatShape(t *testing.T) {
 	}
 	if !strings.Contains(scan.Body.String(), "192.168.10.50") {
 		t.Fatalf("scan should include allowlist clients even when ARP is empty: %s", scan.Body.String())
+	}
+	if !strings.Contains(scan.Body.String(), "192.168.10.60") || !strings.Contains(scan.Body.String(), `"source":"mosdns"`) {
+		t.Fatalf("scan should include MosDNS query-log clients with mosdns source: %s", scan.Body.String())
 	}
 	task := requestJSON(t, app, http.MethodGet, "/api/v1/mosdns/clients/scan/latest", token, nil)
 	if task.Code != http.StatusOK || !strings.Contains(task.Body.String(), `"status":"success"`) || !strings.Contains(task.Body.String(), `"found_count"`) {

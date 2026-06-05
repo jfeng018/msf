@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { Eye, EyeOff, Lock, LogIn, Network, Server, Shield, User } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 
@@ -20,6 +20,7 @@ function LogoMark() {
 
 export default function LoginPage() {
   const navigate = useNavigate();
+  const [params] = useSearchParams();
   const { login } = useAuth();
   const [showPassword, setShowPassword] = useState(false);
   const [username, setUsername] = useState("root");
@@ -33,7 +34,8 @@ export default function LoginPage() {
     setBusy(true);
     try {
       await login(username, password);
-      navigate("/", { replace: true });
+      const redirect = params.get("redirect") || "/";
+      navigate(redirect.startsWith("/") && !redirect.startsWith("//") ? redirect : "/", { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

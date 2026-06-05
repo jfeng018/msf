@@ -21,6 +21,8 @@ export interface CurrentUser {
 interface AuthContextValue {
   loading: boolean;
   initialized: boolean;
+  setupNeedsRecovery: boolean;
+  setupDownloadComponents: string[];
   user: CurrentUser | null;
   refresh: () => Promise<void>;
   login: (username: string, password: string) => Promise<CurrentUser>;
@@ -32,6 +34,8 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [initialized, setInitialized] = useState(false);
+  const [setupNeedsRecovery, setSetupNeedsRecovery] = useState(false);
+  const [setupDownloadComponents, setSetupDownloadComponents] = useState<string[]>([]);
   const [user, setUser] = useState<CurrentUser | null>(null);
 
   const refresh = useCallback(async () => {
@@ -39,7 +43,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       const setup = await api<any>("/api/v1/setup/check", { skipAuth: true });
       const ready = !!setup?.is_initialized;
+      const components = Array.isArray(setup?.download_component)
+        ? setup.download_component.map((item: unknown) => String(item)).filter(Boolean)
+        : [];
       setInitialized(ready);
+      setSetupNeedsRecovery(Boolean(setup?.needs_recovery || setup?.needs_download));
+      setSetupDownloadComponents(components);
       if (ready && getToken()) {
         const me = await api<any>("/api/v1/auth/me");
         setUser(me.user || me.data || null);
@@ -48,6 +57,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
     } catch {
       setInitialized(false);
+      setSetupNeedsRecovery(false);
+      setSetupDownloadComponents([]);
       setUser(null);
     } finally {
       setLoading(false);
@@ -71,6 +82,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const nextUser = payload.user || payload.data?.user || { username };
     setUser(nextUser);
     setInitialized(true);
+    setSetupNeedsRecovery(false);
+    setSetupDownloadComponents([]);
     return nextUser;
   }, []);
 
@@ -80,8 +93,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo(
-    () => ({ loading, initialized, user, refresh, login, logout }),
-    [loading, initialized, user, refresh, login, logout]
+    () => ({ loading, initialized, setupNeedsRecovery, setupDownloadComponents, user, refresh, login, logout }),
+    [loading, initialized, setupNeedsRecovery, setupDownloadComponents, user, refresh, login, logout]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

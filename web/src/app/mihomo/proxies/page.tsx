@@ -728,19 +728,25 @@ function ProxyNodeTile({
 
   return (
     <div
+      role={primaryAction ? "button" : undefined}
+      tabIndex={primaryAction ? 0 : undefined}
+      onClick={primaryAction}
+      onKeyDown={(event) => {
+        if (!primaryAction) return;
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          primaryAction();
+        }
+      }}
       className={cn(
-        "min-h-[4.25rem] min-w-0 rounded-lg border px-2.5 py-2 text-left transition-colors",
+        "min-h-[4.25rem] w-[7.75rem] max-w-full min-w-0 rounded-lg border px-2.5 py-2 text-left transition-colors",
         "bg-muted/40 hover:bg-muted border-transparent",
+        primaryAction && "cursor-pointer focus:outline-none focus:ring-2 focus:ring-primary/30",
         active && "bg-primary text-primary-foreground hover:bg-primary/90"
       )}
       title={`${node.name}${node.delay > 0 ? ` · ${node.delay}ms` : ""}`}
     >
-      <button
-        type="button"
-        onClick={primaryAction}
-        disabled={!primaryAction}
-        className="flex w-full min-w-0 items-center gap-1.5 text-left disabled:cursor-default"
-      >
+      <div className="flex w-full min-w-0 items-center gap-1.5 text-left">
         <img
           alt=""
           className="h-3.5 w-3.5 shrink-0 rounded-[3px] object-contain"
@@ -750,20 +756,20 @@ function ProxyNodeTile({
         <span className={cn("min-w-0 text-xs font-medium", settings.nodeNameDisplay === "wrap" ? "break-all" : "truncate")}>
           {node.name}
         </span>
-      </button>
+      </div>
       <div className="mt-1 flex items-center justify-between gap-2">
-        <button
-          type="button"
-          onClick={primaryAction}
-          disabled={!primaryAction}
-          className={cn("min-w-0 text-left text-[11px] disabled:cursor-default", active ? "text-primary-foreground/75" : "text-muted-foreground", settings.nodeNameDisplay === "wrap" ? "break-all" : "truncate")}
+        <span
+          className={cn("min-w-0 text-left text-[11px]", active ? "text-primary-foreground/75" : "text-muted-foreground", settings.nodeNameDisplay === "wrap" ? "break-all" : "truncate")}
         >
           {node.type || "-"}
-        </button>
+        </span>
         {onTest ? (
           <button
             type="button"
-            onClick={onTest}
+            onClick={(event) => {
+              event.stopPropagation();
+              onTest();
+            }}
             disabled={loading}
             className="shrink-0 rounded-full transition-transform hover:scale-110 disabled:opacity-60"
             aria-label={`测试 ${node.name} 延迟`}
@@ -1357,7 +1363,7 @@ export default function MihomoProxiesPage() {
                     </div>
                     <div className="mt-2 text-[11px] text-muted-foreground">{p.updated}</div>
                     {!collapsed && p.nodes.length > 0 && (
-                      <div className="mt-3 grid grid-cols-[repeat(auto-fit,minmax(7.25rem,1fr))] gap-2">
+                      <div className="mt-3 flex flex-wrap items-start gap-2">
                         {p.nodes.map((node) => (
                           <ProxyNodeTile
                             key={node.name}
@@ -1465,7 +1471,7 @@ export default function MihomoProxiesPage() {
                             </div>
                           </div>
                           {!collapsed && displayNodes.length > 0 && (
-                            <div className="mt-3 grid grid-cols-[repeat(auto-fit,minmax(7.25rem,1fr))] gap-2">
+                            <div className="mt-3 flex flex-wrap items-start gap-2">
                               {displayNodes.map((node) => (
                                 <ProxyNodeTile
                                   key={node.name}
