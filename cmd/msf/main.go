@@ -24,7 +24,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/msm-free/msm-free/internal/server"
+	"github.com/scoltzero/msf/internal/server"
 )
 
 var version = "0.1.0-dev"
