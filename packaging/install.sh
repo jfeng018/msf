@@ -103,6 +103,10 @@ fi
 
 if [ "$legacy_detected" = "1" ]; then
   echo "detected legacy $LEGACY_APP_NAME installation; migrating to $APP_NAME"
+  # Let the old WebUI finish its immediate status refresh before this installer stops it.
+  if [ "${MSF_LEGACY_UPDATE_GRACE_SECONDS:-4}" != "0" ]; then
+    sleep "${MSF_LEGACY_UPDATE_GRACE_SECONDS:-4}"
+  fi
   if command -v systemctl >/dev/null 2>&1; then
     systemctl stop "$LEGACY_SERVICE_NAME" >/dev/null 2>&1 || true
     systemctl disable "$LEGACY_SERVICE_NAME" >/dev/null 2>&1 || true
