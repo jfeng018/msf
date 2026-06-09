@@ -366,61 +366,13 @@ func (a *App) mosDNSCacheOverviewRows(counters map[string]map[string]any, entrie
 	return rows
 }
 
-func (a *App) mosDNSCacheDomainBuckets(entries []map[string]any) map[string]any {
-	buckets := map[string][]map[string]any{
-		"realIp": a.mosDNSGeneratedDomainRows([]string{"realiplist.txt", "realiprule.txt"}, 1000),
-		"fakeIp": a.mosDNSGeneratedDomainRows([]string{"fakeiplist.txt", "fakeiprule.txt"}, 1000),
-		"noV4":   a.mosDNSGeneratedDomainRows([]string{"nov4list.txt", "nov4rule.txt", "nodenov4list.txt", "nodenov4rule.txt"}, 1000),
-		"noV6":   a.mosDNSGeneratedDomainRows([]string{"nov6list.txt", "nov6rule.txt", "nodenov6list.txt", "nodenov6rule.txt"}, 1000),
+func (a *App) mosDNSCacheDomainBuckets(_ []map[string]any) map[string]any {
+	return map[string]any{
+		"realIp": a.mosDNSGeneratedDomainRows([]string{"realiplist.txt"}, 1000),
+		"fakeIp": a.mosDNSGeneratedDomainRows([]string{"fakeiplist.txt"}, 1000),
+		"noV4":   a.mosDNSGeneratedDomainRows([]string{"nov4list.txt"}, 1000),
+		"noV6":   a.mosDNSGeneratedDomainRows([]string{"nov6list.txt"}, 1000),
 	}
-	if len(buckets["realIp"]) == 0 {
-		buckets["realIp"] = a.mosDNSCacheDumpDomainRows([]string{"cache_all", "cache_all_noleak", "cache_cn", "cache_cnmihomo", "cache_google", "cache_node", "cache_google_node"}, 1000)
-	}
-	seen := map[string]map[string]bool{
-		"realIp": {},
-		"fakeIp": {},
-		"noV4":   {},
-		"noV6":   {},
-	}
-	for _, row := range buckets["realIp"] {
-		seen["realIp"][stringMapValue(row, "domain")] = true
-	}
-	for _, entry := range entries {
-		domain := normalizeCacheDomainCandidate(stringMapValue(entry, "query_name"))
-		if domain == "" {
-			continue
-		}
-		bucket := "realIp"
-		rule := strings.ToLower(stringMapValue(entry, "domain_set") + " " + stringMapValue(entry, "rule"))
-		switch {
-		case strings.Contains(rule, "nov4") || strings.Contains(rule, "no_v4"):
-			bucket = "noV4"
-		case strings.Contains(rule, "nov6") || strings.Contains(rule, "no_v6"):
-			bucket = "noV6"
-		case entryHasFakeIP(entry):
-			bucket = "fakeIp"
-		}
-		if seen[bucket][domain] {
-			continue
-		}
-		seen[bucket][domain] = true
-		buckets[bucket] = append(buckets[bucket], map[string]any{
-			"id":     fmt.Sprintf("%010d", len(buckets[bucket])+1),
-			"domain": domain,
-			"date":   dateOnly(stringMapValue(entry, "query_time")),
-			"source": "query-log",
-		})
-	}
-	out := map[string]any{}
-	for key, rows := range buckets {
-		for i := range rows {
-			if rows[i]["id"] == nil || rows[i]["id"] == "" {
-				rows[i]["id"] = fmt.Sprintf("%010d", i+1)
-			}
-		}
-		out[key] = rows
-	}
-	return out
 }
 
 func (a *App) mosDNSGeneratedDomainRows(names []string, limit int) []map[string]any {

@@ -116,7 +116,7 @@ func TestSetupInitializeLoginAndGeneratedConfigs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(nft), `iifname { "lo", "eth0" }`) || !strings.Contains(string(nft), "tproxy to :7896") || !strings.Contains(string(nft), "redirect to :7877") || !strings.Contains(string(nft), "28.0.0.0/8") || !strings.Contains(string(nft), "set dns_ipv4 {\n    type ipv4_addr\n    flags interval") {
+	if strings.Contains(string(nft), "flush ruleset") || !strings.Contains(string(nft), `iifname { "lo", "eth0" }`) || !strings.Contains(string(nft), "tproxy to :7896") || !strings.Contains(string(nft), "redirect to :7877") || !strings.Contains(string(nft), "28.0.0.0/8") || !strings.Contains(string(nft), "set dns_ipv4 {\n    type ipv4_addr\n    flags interval") {
 		t.Fatalf("nft template not rendered correctly:\n%s", nft)
 	}
 }
@@ -1110,13 +1110,16 @@ func TestMosDNSSystemCacheUsesGeneratedDomainBuckets(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(genDir, "realiplist.txt"), []byte("2026-06-08 apple.com 3\nfull:example.cn\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(genDir, "fakeiprule.txt"), []byte("domain:chatgpt.com\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(genDir, "fakeiplist.txt"), []byte("domain:chatgpt.com\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(genDir, "nov4list.txt"), []byte("no-a.example\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(genDir, "nodenov6rule.txt"), []byte("domain:no-aaaa.example\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(genDir, "nov6list.txt"), []byte("domain:no-aaaa.example\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app.DataDir, "logs/mosdns.out.log"), []byte(`client_ip=192.168.10.9 query_name=query-only.example qtype=A rule=my_fakeiprule rcode=NOERROR A: 28.0.0.2`+"\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1135,10 +1138,20 @@ func TestMosDNSSystemCacheUsesGeneratedDomainBuckets(t *testing.T) {
 	if !strings.Contains(fmt.Sprint(domains["realIp"]), "apple.com") || !strings.Contains(fmt.Sprint(domains["fakeIp"]), "chatgpt.com") {
 		t.Fatalf("system cache domains should expose generated buckets: %s", res.Body.String())
 	}
+	if strings.Contains(fmt.Sprint(domains), "query-only.example") {
+		t.Fatalf("system cache domains must not include query-log fallback rows: %s", fmt.Sprint(domains))
+	}
 
 	detail := requestJSON(t, app, http.MethodGet, "/api/v1/mosdns/cache/detailed", token, nil)
 	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"totalDomains":5`) || !strings.Contains(detail.Body.String(), "no-aaaa.example") {
 		t.Fatalf("detailed cache should expose generated stats/domains: status=%d body=%s", detail.Code, detail.Body.String())
+	}
+	var detailBody map[string]any
+	_ = json.Unmarshal(detail.Body.Bytes(), &detailBody)
+	detailData := detailBody["data"].(map[string]any)
+	detailDomains := detailData["domains"].(map[string]any)
+	if strings.Contains(fmt.Sprint(detailDomains), "query-only.example") {
+		t.Fatalf("detailed cache domains must not include query-log fallback rows: %s", fmt.Sprint(detailDomains))
 	}
 }
 

@@ -451,6 +451,10 @@ func (a *App) applyNFT(ctx context.Context) (string, error) {
 	if _, err := os.Stat(nftPath); err != nil {
 		return "", fmt.Errorf("nftables config is missing: %s", nftPath)
 	}
+	if err := sanitizeNFTConfigFile(nftPath); err != nil {
+		return "", err
+	}
+	_, _ = combinedOutputWithTimeout(ctx, 8*time.Second, "nft", "delete", "table", "inet", "msf")
 	var output bytes.Buffer
 	cmds := [][]string{
 		{"nft", "-f", nftPath},
@@ -472,6 +476,33 @@ func (a *App) applyNFT(ctx context.Context) (string, error) {
 		}
 	}
 	return output.String(), nil
+}
+
+func sanitizeNFTConfigFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	sanitized := stripGlobalNFTRulesetFlush(string(raw))
+	if sanitized == string(raw) {
+		return nil
+	}
+	return os.WriteFile(path, []byte(sanitized), info.Mode())
+}
+
+func stripGlobalNFTRulesetFlush(text string) string {
+	var out strings.Builder
+	for _, line := range strings.SplitAfter(text, "\n") {
+		if strings.EqualFold(strings.TrimSpace(line), "flush ruleset") {
+			continue
+		}
+		out.WriteString(line)
+	}
+	return out.String()
 }
 
 func (a *App) handleNFTClear(w http.ResponseWriter, r *http.Request) {
