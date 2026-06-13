@@ -294,7 +294,7 @@ func (a *App) startSelfUpdateInstaller(archivePath string) error {
 	}
 	if serverSystemdAvailable() {
 		unit := "msf-self-update-" + time.Now().Format("20060102150405")
-		runArgs := append([]string{"--unit", unit, "--collect", "--property=Type=oneshot", "/bin/sh", installScript}, args...)
+		runArgs := systemdRunSelfUpdateArgs(unit, installScript, args)
 		out, err := exec.Command("systemd-run", runArgs...).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("start update installer: %w: %s", err, strings.TrimSpace(string(out)))
@@ -313,6 +313,23 @@ func (a *App) startSelfUpdateInstaller(archivePath string) error {
 		_, _ = a.DB.Exec(`update update_info set current_version=?,has_update=false,status='completed',progress=100,error_message='',updated_at=? where component='msf'`, a.Version, nowString())
 	}()
 	return nil
+}
+
+func systemdRunSelfUpdateArgs(unit, installScript string, args []string) []string {
+	runArgs := []string{
+		"--unit", unit,
+		"--collect",
+		"--no-block",
+		"--setenv=MSF_INSTALL_DETACHED=1",
+		"--property=Type=oneshot",
+		"/bin/sh",
+		"-c",
+		`sleep "${MSF_SELF_UPDATE_GRACE_SECONDS:-2}"; exec "$@"`,
+		"msf-self-update",
+		"/bin/sh",
+		installScript,
+	}
+	return append(runArgs, args...)
 }
 
 func selfUpdateInstallPrefix() string {

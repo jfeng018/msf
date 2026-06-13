@@ -618,6 +618,47 @@ func TestSelfUpdateStateExposesInstallAndAcceleratedDownloadURL(t *testing.T) {
 	}
 }
 
+func TestSystemdRunSelfUpdateArgsDetachInstaller(t *testing.T) {
+	args := systemdRunSelfUpdateArgs("msf-self-update-test", "/tmp/msf-update/install.sh", []string{
+		"--prefix", "/usr/local",
+		"--data-dir", "/opt/msf",
+		"--service-name", "msf",
+		"--port", "7777",
+	})
+	joined := strings.Join(args, "\x00")
+	for _, want := range []string{
+		"--unit\x00msf-self-update-test",
+		"--collect",
+		"--no-block",
+		"--setenv=MSF_INSTALL_DETACHED=1",
+		"--property=Type=oneshot",
+		`sleep "${MSF_SELF_UPDATE_GRACE_SECONDS:-2}"; exec "$@"`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("systemd-run args missing %q: %#v", want, args)
+		}
+	}
+	wantSuffix := []string{
+		"/bin/sh",
+		"-c",
+		`sleep "${MSF_SELF_UPDATE_GRACE_SECONDS:-2}"; exec "$@"`,
+		"msf-self-update",
+		"/bin/sh",
+		"/tmp/msf-update/install.sh",
+		"--prefix",
+		"/usr/local",
+		"--data-dir",
+		"/opt/msf",
+		"--service-name",
+		"msf",
+		"--port",
+		"7777",
+	}
+	if len(args) < len(wantSuffix) || !reflect.DeepEqual(args[len(args)-len(wantSuffix):], wantSuffix) {
+		t.Fatalf("systemd-run args suffix mismatch:\n got %#v\nwant %#v", args, wantSuffix)
+	}
+}
+
 func TestComponentRemoteVersionParsesReleaseMetadata(t *testing.T) {
 	app := newTestApp(t)
 
