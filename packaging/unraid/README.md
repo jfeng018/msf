@@ -49,7 +49,7 @@ https://raw.githubusercontent.com/scoltzero/msf/<branch>/msf.plg
 - The WebGUI control script is `/etc/rc.d/rc.msf`.
 - Persistent config is `/boot/config/plugins/msf/msf.cfg`.
 - Persistent application data defaults to `/mnt/user/appdata/msf`.
-- The Settings page is a lightweight Unraid plugin control page only: enablement, listen host/port, data directory, status, and Open WebUI.
+- The Utilities page entry opens a lightweight Unraid plugin control page only: enablement, listen host/port, data directory, status, and Open WebUI.
 - The full management interface runs in the separate msf WebUI.
 - On a fresh install, before setup exists, the plugin starts only the `msf` management WebUI. After setup is completed, `msf` restores enabled Mihomo, MosDNS and nftables state on subsequent starts.
 - If the data directory is under `/mnt/user`, the rc script waits until the array user share path is available.
