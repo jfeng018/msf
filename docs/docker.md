@@ -2,7 +2,7 @@
 
 Docker host-network 部署目前是实验性能力，尚未作为推荐安装方式。它适合熟悉 Docker、nftables、策略路由和透明代理行为的用户验证当前实现；生产或长期使用优先选择 [Linux tarball/systemd](install/linux.md)、[fnOS FPK](install/fnos-fpk.md) 或 [Unraid PLG](install/unraid-plg.md)。
 
-当前版本：`v0.3.5`
+当前版本：`v0.3.6`
 
 ## 当前状态
 
