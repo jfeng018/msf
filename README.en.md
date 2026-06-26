@@ -35,7 +35,7 @@ Current release: `v0.3.6`
 | Linux tarball/systemd | Stable | [Linux install](docs/install/linux.md) | `msf update` / `msf uninstall` |
 | fnOS FPK | Supported | [fnOS FPK install](docs/install/fnos-fpk.md) | fnOS / Feiniu App Center or FPK package manager |
 | Unraid PLG | Stable | [Unraid PLG install](docs/install/unraid-plg.md) | Unraid plugin manager |
-| Docker TUN host/macvlan | Experimental, not complete | [Docker experimental deployment](docs/docker.md) | Docker / Compose / container manager |
+| Docker TUN host/macvlan | Experimental, not complete | [Docker experimental deployment](docs/docker.en.md) | Docker / Compose / container manager |
 
 `msf update` and `msf uninstall` are only for Linux tarball/systemd installs. fnOS FPK, Unraid PLG, and Docker installs must be updated or removed through their platform manager.
 

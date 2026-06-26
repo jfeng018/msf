@@ -1,5 +1,7 @@
 # Docker TUN 实验部署
 
+[English version](docker.en.md)
+
 Docker 部署目前仍是实验性能力，尚未作为推荐安装方式。它适合熟悉 Docker、TUN、静态路由和旁路由接入的用户验证当前实现；生产或长期使用优先选择 [Linux tarball/systemd](install/linux.md)、[fnOS FPK](install/fnos-fpk.md) 或 [Unraid PLG](install/unraid-plg.md)。
 
 当前版本：`v0.3.6`
