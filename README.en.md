@@ -26,7 +26,7 @@ Current release: `v0.3.6`
 ## Architecture Diagram
 
 <p align="center">
-  <img src="docs/png/framework-architecture.svg" alt="msf side-router proxy architecture diagram">
+  <img src="docs/png/framework-architecture.en.svg" alt="msf side-router proxy architecture diagram">
 </p>
 
 ## Platform Support
