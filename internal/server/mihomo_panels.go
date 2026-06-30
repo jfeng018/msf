@@ -890,7 +890,7 @@ func (a *App) writeMihomoProviderDelete(w http.ResponseWriter, r *http.Request, 
 	providers := normalizeConfigProviders(cfg[section])
 	delete(providers, name)
 	cfg[section] = providerConfigMap(providers)
-	if err := a.writeMihomoConfigMap(cfg); err != nil {
+	if err := a.writeMihomoConfigMap(cfg, section); err != nil {
 		writeError(w, http.StatusBadRequest, "write_failed", err.Error())
 		return
 	}
@@ -926,7 +926,7 @@ func (a *App) upsertMihomoProvider(section, name string, provider map[string]any
 	providers := normalizeConfigProviders(cfg[section])
 	providers[name] = provider
 	cfg[section] = providerConfigMap(providers)
-	return a.writeMihomoConfigMap(cfg)
+	return a.writeMihomoConfigMap(cfg, section)
 }
 
 func normalizeProviderRequest(name string, req map[string]any, section string) (map[string]any, error) {
@@ -1009,7 +1009,7 @@ func sanitizeProviderName(name string) string {
 	return name
 }
 
-func (a *App) writeMihomoConfigMap(cfg map[string]any) error {
+func (a *App) writeMihomoConfigMap(cfg map[string]any, sections ...string) error {
 	if err := a.ensureMihomoGeneratedBackup(); err != nil {
 		return err
 	}
@@ -1020,7 +1020,9 @@ func (a *App) writeMihomoConfigMap(cfg map[string]any) error {
 	if err != nil {
 		return err
 	}
-	a.setMihomoConfigMode("custom")
+	if a.mihomoConfigMode() != "generated" || !mihomoConfigSectionsDefaultSafe(sections) {
+		a.setMihomoConfigMode("custom")
+	}
 	content := string(b)
 	if err := a.writeTextFile("configs/mihomo/config.yaml", content); err != nil {
 		return err
@@ -1029,12 +1031,12 @@ func (a *App) writeMihomoConfigMap(cfg map[string]any) error {
 }
 
 func (a *App) syncAppliedMihomoUserConfig(content string) error {
-	applied := strings.TrimSpace(a.setting(mihomoAppliedUserConfigKey, ""))
-	if applied == "" {
-		return nil
-	}
-	rel, err := a.mihomoUserConfigRel("", applied)
-	if err != nil {
+	return a.syncAppliedMihomoUserConfigAs(content, "system")
+}
+
+func (a *App) syncAppliedMihomoUserConfigAs(content, username string) error {
+	rel, ok := a.appliedMihomoUserConfigRel()
+	if !ok {
 		return nil
 	}
 	path, err := a.safePath(rel)
@@ -1047,10 +1049,13 @@ func (a *App) syncAppliedMihomoUserConfig(content string) error {
 		}
 		return err
 	}
-	if old, err := a.readTextFile(rel); err == nil {
-		a.createConfigHistory("mihomo", rel, old, "auto backup before applied Mihomo user config sync", "system")
+	if username == "" {
+		username = "system"
 	}
-	return a.writeTextFile(rel, content)
+	if old, err := a.readTextFile(rel); err == nil {
+		a.createConfigHistory("mihomo", rel, old, "auto backup before applied Mihomo user config sync", username)
+	}
+	return a.writeTextFileDirect(rel, content)
 }
 
 func normalizeConfigProviders(raw any) map[string]map[string]any {
@@ -1230,6 +1235,12 @@ func (a *App) uploadConfigZip(w http.ResponseWriter, r *http.Request, destRel st
 	if err := restoreZipToDir(tmpPath, dest); err != nil {
 		writeError(w, http.StatusBadRequest, "restore_failed", err.Error())
 		return
+	}
+	if destRel == "configs/mihomo" {
+		if err := a.reconcileAppliedMihomoUserConfig(); err != nil {
+			writeError(w, http.StatusBadRequest, "restore_failed", err.Error())
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "restart_required": true, "data": map[string]any{"restart_required": true}})
 }
