@@ -942,8 +942,12 @@ func normalizeProviderRequest(name string, req map[string]any, section string) (
 		return nil, fmt.Errorf("provider name required")
 	}
 	u := strings.TrimSpace(stringMapValue(req, "url"))
-	if u == "" {
+	providerType := strings.ToLower(strings.TrimSpace(firstNonEmpty(stringMapValue(req, "type"), "http")))
+	if u == "" && providerType != "file" {
 		return nil, fmt.Errorf("provider url required")
+	}
+	if providerType == "file" && strings.TrimSpace(stringMapValue(req, "path")) == "" {
+		return nil, fmt.Errorf("provider path required")
 	}
 	provider := map[string]any{}
 	for k, v := range req {
@@ -953,9 +957,9 @@ func normalizeProviderRequest(name string, req map[string]any, section string) (
 		provider[k] = v
 	}
 	if provider["type"] == nil {
-		provider["type"] = "http"
+		provider["type"] = providerType
 	}
-	if provider["url"] == nil {
+	if provider["url"] == nil && u != "" {
 		provider["url"] = u
 	}
 	if provider["path"] == nil {
@@ -1017,7 +1021,36 @@ func (a *App) writeMihomoConfigMap(cfg map[string]any) error {
 		return err
 	}
 	a.setMihomoConfigMode("custom")
-	return a.writeTextFile("configs/mihomo/config.yaml", string(b))
+	content := string(b)
+	if err := a.writeTextFile("configs/mihomo/config.yaml", content); err != nil {
+		return err
+	}
+	return a.syncAppliedMihomoUserConfig(content)
+}
+
+func (a *App) syncAppliedMihomoUserConfig(content string) error {
+	applied := strings.TrimSpace(a.setting(mihomoAppliedUserConfigKey, ""))
+	if applied == "" {
+		return nil
+	}
+	rel, err := a.mihomoUserConfigRel("", applied)
+	if err != nil {
+		return nil
+	}
+	path, err := a.safePath(rel)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if old, err := a.readTextFile(rel); err == nil {
+		a.createConfigHistory("mihomo", rel, old, "auto backup before applied Mihomo user config sync", "system")
+	}
+	return a.writeTextFile(rel, content)
 }
 
 func normalizeConfigProviders(raw any) map[string]map[string]any {

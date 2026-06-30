@@ -1826,6 +1826,13 @@ func TestMihomoProviderConfigManagementCreatesHistory(t *testing.T) {
 	if !strings.Contains(string(cfg), "airport:") || !strings.Contains(string(cfg), "https://example.com/sub.yaml") {
 		t.Fatalf("proxy provider not persisted:\n%s", string(cfg))
 	}
+	fileProvider := requestJSON(t, app, http.MethodPut, "/api/v1/mihomo/proxy-providers/msf_manual", token, map[string]any{
+		"type": "file",
+		"path": "./proxy_providers/msf_manual.yaml",
+	})
+	if fileProvider.Code != http.StatusOK || !strings.Contains(fileProvider.Body.String(), `"restart_required":false`) {
+		t.Fatalf("file proxy provider without url should save: status=%d body=%s", fileProvider.Code, fileProvider.Body.String())
+	}
 	update := requestJSON(t, app, http.MethodPost, "/api/v1/mihomo/proxy-providers/airport/update", token, nil)
 	if update.Code != http.StatusOK || !strings.Contains(update.Body.String(), `"healthcheck":true`) {
 		t.Fatalf("proxy provider update status=%d body=%s", update.Code, update.Body.String())
@@ -1905,6 +1912,57 @@ func TestMihomoCustomConfigModeProtectsGeneratedConfigAndRestoresBackup(t *testi
 	}
 	if !strings.Contains(active, "Custom") || strings.Contains(active, "https://example.com/sub.yaml") {
 		t.Fatalf("custom config should not be overwritten by generated writes:\n%s", active)
+	}
+
+	syncedProvider := requestJSON(t, app, http.MethodPut, "/api/v1/mihomo/proxy-providers/synced", token, map[string]any{
+		"url":      "https://example.com/synced.yaml",
+		"interval": 3600,
+	})
+	if syncedProvider.Code != http.StatusOK || !strings.Contains(syncedProvider.Body.String(), `"restart_required":false`) {
+		t.Fatalf("synced proxy provider put status=%d body=%s", syncedProvider.Code, syncedProvider.Body.String())
+	}
+	active, err = app.readTextFile(mihomoActiveConfigRelPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userConfig, err := app.readTextFile("configs/mihomo/user_configs/custom.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, text := range map[string]string{
+		mihomoActiveConfigRelPath:                 active,
+		"configs/mihomo/user_configs/custom.yaml": userConfig,
+	} {
+		if !strings.Contains(text, "synced:") || !strings.Contains(text, "https://example.com/synced.yaml") {
+			t.Fatalf("synced provider missing from %s:\n%s", path, text)
+		}
+	}
+	var userHistoryCount int
+	if err := app.DB.QueryRow(`select count(*) from config_histories where service='mihomo' and file_path='configs/mihomo/user_configs/custom.yaml'`).Scan(&userHistoryCount); err != nil {
+		t.Fatal(err)
+	}
+	if userHistoryCount == 0 {
+		t.Fatal("expected applied user config sync to create history")
+	}
+	deletedProvider := requestJSON(t, app, http.MethodDelete, "/api/v1/mihomo/proxy-providers/synced", token, nil)
+	if deletedProvider.Code != http.StatusOK || !strings.Contains(deletedProvider.Body.String(), `"restart_required":false`) {
+		t.Fatalf("synced proxy provider delete status=%d body=%s", deletedProvider.Code, deletedProvider.Body.String())
+	}
+	active, err = app.readTextFile(mihomoActiveConfigRelPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userConfig, err = app.readTextFile("configs/mihomo/user_configs/custom.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, text := range map[string]string{
+		mihomoActiveConfigRelPath:                 active,
+		"configs/mihomo/user_configs/custom.yaml": userConfig,
+	} {
+		if strings.Contains(text, "synced:") || strings.Contains(text, "https://example.com/synced.yaml") {
+			t.Fatalf("synced provider should be deleted from %s:\n%s", path, text)
+		}
 	}
 
 	groups := requestJSON(t, app, http.MethodPut, "/api/v1/mihomo/proxy-groups-config", token, map[string]any{
